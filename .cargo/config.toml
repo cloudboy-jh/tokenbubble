@@ -1,0 +1,3 @@
+[alias]
+# Source development loop: rebuild on save and rerun the app; see `cargo dev --help`.
+dev = "run --quiet --locked -p tokenbubble-dev --"

@@ -66,6 +66,18 @@ impl CollectError {
             Self::NoUsageData => "no_usage_data",
         }
     }
+
+    /// A failure that says nothing about the account: the previous reading stays valid
+    /// and a retry may succeed without user action.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::RateLimited { .. }
+                | Self::Server { .. }
+                | Self::Transport(_)
+                | Self::InvalidResponse
+        )
+    }
 }
 
 impl fmt::Display for CollectError {

@@ -1,40 +1,56 @@
-//! The usage panel view. It renders [`PanelState`] and asks its host to refresh; hosts own
-//! collection so Compi and the standalone app can schedule it their own way.
+//! The usage panel view. It renders [`PanelState`] and asks its host to refresh or open
+//! settings; hosts own collection and windows, so Compi and the standalone app can each
+//! schedule and place it their own way.
+
+use std::time::Duration;
 
 use gpui::{
-    Context, EventEmitter, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled,
-    Window, div, prelude::*, px, relative,
+    Animation, AnimationExt as _, ClipboardItem, Context, EventEmitter, FontWeight, IntoElement,
+    ParentElement, Render, SharedString, Stateful, Styled, Window, div, prelude::*,
+    pulsating_between, px, relative,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use tokenbubble_core::model::UsageSnapshot;
 use tokenbubble_core::providers::CollectError;
 
-use crate::presentation::{BarView, Body, PanelState, PanelView, Tone, present};
+use crate::presentation::{
+    BarView, Body, DisplayOptions, PanelState, PanelView, Tone, preferred_height, present,
+};
 use crate::theme::PanelTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelEvent {
     RefreshRequested,
+    SettingsRequested,
 }
 
 pub struct UsagePanel {
     state: PanelState,
     theme: PanelTheme,
+    options: DisplayOptions,
+    /// The error detail was just copied; cleared by the next state change.
+    copied: bool,
 }
 
 impl EventEmitter<PanelEvent> for UsagePanel {}
 
 impl UsagePanel {
-    pub fn new(theme: PanelTheme) -> Self {
+    pub fn new(theme: PanelTheme, options: DisplayOptions) -> Self {
         Self {
             state: PanelState::default(),
             theme,
+            options,
+            copied: false,
         }
     }
 
     pub fn state(&self) -> &PanelState {
         &self.state
+    }
+
+    pub fn options(&self) -> DisplayOptions {
+        self.options
     }
 
     pub fn begin_refresh(&mut self, cx: &mut Context<Self>) {
@@ -44,6 +60,7 @@ impl UsagePanel {
 
     pub fn apply(&mut self, result: Result<UsageSnapshot, CollectError>, cx: &mut Context<Self>) {
         self.state.apply(result);
+        self.copied = false;
         cx.notify();
     }
 
@@ -51,11 +68,30 @@ impl UsagePanel {
         self.theme = theme;
         cx.notify();
     }
+
+    pub fn set_options(&mut self, options: DisplayOptions, cx: &mut Context<Self>) {
+        self.options = options;
+        cx.notify();
+    }
+
+    /// Logical height that fits the current content without scrolling.
+    pub fn preferred_height(&self) -> f32 {
+        preferred_height(&self.view())
+    }
+
+    fn view(&self) -> PanelView {
+        present(
+            &self.state,
+            Timestamp::now(),
+            &TimeZone::system(),
+            self.options,
+        )
+    }
 }
 
 impl Render for UsagePanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = present(&self.state, Timestamp::now(), &TimeZone::system());
+        let view = self.view();
         let theme = self.theme;
         div()
             .id("tokenbubble-panel")
@@ -69,7 +105,7 @@ impl Render for UsagePanel {
             .text_color(theme.text)
             .text_size(px(13.0))
             .child(header(&view, &theme))
-            .child(body(&view, &theme))
+            .child(body(&view, &theme, self.copied, cx))
             .children((!view.money.is_empty()).then(|| money(&view, &theme)))
             .child(footer(&view, &theme, cx))
     }
@@ -116,7 +152,12 @@ fn header(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
         }))
 }
 
-fn body(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
+fn body(
+    view: &PanelView,
+    theme: &PanelTheme,
+    copied: bool,
+    cx: &mut Context<UsagePanel>,
+) -> impl IntoElement {
     let container = div().flex().flex_col().gap(px(14.0));
     match &view.body {
         Body::Loading => container.child(
@@ -124,16 +165,43 @@ fn body(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
                 .text_color(theme.muted)
                 .child(format!("Loading {} usage…", view.title)),
         ),
-        Body::Message(message) => container.child(
-            div()
-                .p(px(12.0))
-                .rounded(px(8.0))
-                .bg(theme.surface)
-                .border_1()
-                .border_color(theme.border)
-                .line_height(relative(1.4))
-                .child(SharedString::from(message.clone())),
-        ),
+        Body::Message { text, detail } => {
+            let detail = detail.clone();
+            container.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .p(px(12.0))
+                    .rounded(px(8.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .line_height(relative(1.4))
+                            .child(SharedString::from(text.clone())),
+                    )
+                    .child(
+                        div().flex().child(
+                            action(
+                                "tokenbubble-copy-error",
+                                if copied { "Copied" } else { "Copy error" },
+                                theme,
+                            )
+                            .on_click(cx.listener(
+                                move |panel, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        detail.clone(),
+                                    ));
+                                    panel.copied = true;
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                    ),
+            )
+        }
         Body::Bars(bars) => container.children(bars.iter().map(|bar| quota_bar(bar, theme))),
     }
 }
@@ -207,25 +275,56 @@ fn money(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
         }))
 }
 
-fn footer(view: &PanelView, theme: &PanelTheme, cx: &mut Context<UsagePanel>) -> impl IntoElement {
-    let button = div()
-        .id("tokenbubble-refresh")
+/// A small bordered text button.
+fn action(id: &'static str, label: &'static str, theme: &PanelTheme) -> Stateful<gpui::Div> {
+    let hover = theme.surface;
+    div()
+        .id(id)
         .flex_none()
         .px(px(10.0))
         .py(px(4.0))
         .rounded(px(6.0))
         .border_1()
         .border_color(theme.border)
-        .text_size(px(12.0));
-    let button = if view.refreshing {
-        button.text_color(theme.muted).child("Refreshing…")
-    } else {
-        let hover = theme.surface;
-        button
-            .cursor_pointer()
-            .hover(move |style| style.bg(hover))
+        .text_size(px(12.0))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .child(label)
+}
+
+fn footer(view: &PanelView, theme: &PanelTheme, cx: &mut Context<UsagePanel>) -> impl IntoElement {
+    let status = view.status.clone().map(|(text, tone)| {
+        let label = div().text_color(theme.tone(tone)).child(text);
+        if view.refreshing {
+            label
+                .with_animation(
+                    "tokenbubble-refreshing",
+                    Animation::new(Duration::from_millis(1200))
+                        .repeat()
+                        .with_easing(pulsating_between(0.35, 1.0)),
+                    |label, opacity| label.opacity(opacity),
+                )
+                .into_any_element()
+        } else {
+            label.into_any_element()
+        }
+    });
+    let refresh = if view.refreshing {
+        div()
+            .flex_none()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(12.0))
+            .text_color(theme.muted)
             .child("Refresh")
+            .into_any_element()
+    } else {
+        action("tokenbubble-refresh", "Refresh", theme)
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PanelEvent::RefreshRequested)))
+            .into_any_element()
     };
     div()
         .mt_auto()
@@ -236,12 +335,11 @@ fn footer(view: &PanelView, theme: &PanelTheme, cx: &mut Context<UsagePanel>) ->
         .items_center()
         .justify_between()
         .gap(px(12.0))
+        .child(div().min_w_0().text_size(px(12.0)).children(status))
         .child(
-            div().min_w_0().text_size(px(12.0)).children(
-                view.status
-                    .clone()
-                    .map(|(text, tone)| div().text_color(theme.tone(tone)).child(text)),
+            div().flex().flex_none().gap(px(6.0)).child(refresh).child(
+                action("tokenbubble-settings", "Settings", theme)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PanelEvent::SettingsRequested))),
             ),
         )
-        .child(button)
 }

@@ -1,7 +1,9 @@
-//! Renderer-independent panel state and the text it displays.
+//! Renderer-independent panel state and everything it displays: panel text, the tray
+//! tooltip, and the tray meter's bar fractions.
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
+use tokenbubble_core::config::{BarFill, ResetDisplay, Settings};
 use tokenbubble_core::model::{
     Credits, ProviderId, QuotaWindow, SpendLimit, UsageSnapshot, WindowKind,
 };
@@ -32,7 +34,7 @@ impl PanelState {
                 self.error = None;
             }
             Err(error) => {
-                if !is_transient(&error) {
+                if !error.is_transient() {
                     self.snapshot = None;
                 }
                 self.error = Some(error);
@@ -41,14 +43,28 @@ impl PanelState {
     }
 }
 
-fn is_transient(error: &CollectError) -> bool {
-    matches!(
-        error,
-        CollectError::RateLimited { .. }
-            | CollectError::Server { .. }
-            | CollectError::Transport(_)
-            | CollectError::InvalidResponse
-    )
+/// The display-related subset of [`Settings`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayOptions {
+    pub bar_fill: BarFill,
+    pub reset_display: ResetDisplay,
+    pub show_credits: bool,
+}
+
+impl From<&Settings> for DisplayOptions {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            bar_fill: settings.bar_fill,
+            reset_display: settings.reset_display,
+            show_credits: settings.show_credits,
+        }
+    }
+}
+
+impl Default for DisplayOptions {
+    fn default() -> Self {
+        Self::from(&Settings::default())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,7 +89,11 @@ pub struct PanelView {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Body {
     Loading,
-    Message(String),
+    /// A failure with no reading to show. `detail` is the raw error for copying.
+    Message {
+        text: String,
+        detail: String,
+    },
     Bars(Vec<BarView>),
 }
 
@@ -96,11 +116,13 @@ pub struct MoneyRow {
 
 const WARNING_PERCENT: f64 = 75.0;
 
-pub fn present(state: &PanelState, now: Timestamp, tz: &TimeZone) -> PanelView {
-    let provider = state
-        .snapshot
-        .as_ref()
-        .map_or(ProviderId::Codex, |snapshot| snapshot.provider);
+pub fn present(
+    state: &PanelState,
+    now: Timestamp,
+    tz: &TimeZone,
+    options: DisplayOptions,
+) -> PanelView {
+    let provider = provider_of(state);
     let mut view = PanelView {
         title: provider_name(provider),
         plan: None,
@@ -112,14 +134,14 @@ pub fn present(state: &PanelState, now: Timestamp, tz: &TimeZone) -> PanelView {
     };
 
     let Some(snapshot) = &state.snapshot else {
-        match &state.error {
-            Some(error) => {
-                view.body = Body::Message(error_message(provider, error));
-                if state.refreshing {
-                    view.status = Some(("Refreshing…".to_owned(), Tone::Muted));
-                }
-            }
-            None => view.body = Body::Loading,
+        if let Some(error) = &state.error {
+            view.body = Body::Message {
+                text: error_message(provider, error),
+                detail: format!("{} ({})", error, error.kind()),
+            };
+        }
+        if state.refreshing {
+            view.status = Some(("Refreshing…".to_owned(), Tone::Muted));
         }
         return view;
     };
@@ -130,10 +152,12 @@ pub fn present(state: &PanelState, now: Timestamp, tz: &TimeZone) -> PanelView {
         snapshot
             .windows
             .iter()
-            .map(|window| bar(window, now, tz))
+            .map(|window| bar(window, now, tz, options))
             .collect(),
     );
-    view.money = money_rows(snapshot.credits.as_ref(), snapshot.spend_limit.as_ref());
+    if options.show_credits {
+        view.money = money_rows(snapshot.credits.as_ref(), snapshot.spend_limit.as_ref());
+    }
     let age = ago(now.duration_since(snapshot.measured_at));
     view.status = Some(if state.refreshing {
         ("Refreshing…".to_owned(), Tone::Muted)
@@ -151,6 +175,150 @@ pub fn present(state: &PanelState, now: Timestamp, tz: &TimeZone) -> PanelView {
     view
 }
 
+/// Logical height that fits `view` without scrolling, mirroring the panel's layout metrics.
+/// GPUI's default line height is about 1.6 × the font size.
+pub fn preferred_height(view: &PanelView) -> f32 {
+    const PADDING: f32 = 32.0;
+    const SECTION_GAP: f32 = 16.0;
+    /// 16 px title, 2 px gap, 12 px account line.
+    const HEADER: f32 = 48.0;
+    /// Border, 12 px padding, 30 px buttons.
+    const FOOTER: f32 = 44.0;
+    const LINE: f32 = 21.0;
+    const SMALL_LINE: f32 = 19.5;
+    let body = match &view.body {
+        Body::Loading => LINE,
+        // Card padding and border, the wrapped message, and the copy button row.
+        Body::Message { text, .. } => 26.0 + LINE * (text.len() / 44 + 1) as f32 + 10.0 + 30.0,
+        Body::Bars(bars) => {
+            bars.iter()
+                .map(|bar| {
+                    let reset = if bar.reset.is_some() {
+                        6.0 + SMALL_LINE
+                    } else {
+                        0.0
+                    };
+                    LINE + 6.0 + 8.0 + reset
+                })
+                .sum::<f32>()
+                + 14.0 * bars.len().saturating_sub(1) as f32
+        }
+    };
+    let money = if view.money.is_empty() {
+        0.0
+    } else {
+        SECTION_GAP + 13.0 + LINE * view.money.len() as f32 + 6.0 * (view.money.len() - 1) as f32
+    };
+    PADDING + HEADER + SECTION_GAP + body + money + SECTION_GAP + FOOTER
+}
+
+/// Fractions for the tray meter: session on top, weekly below, each `0.0..=1.0` in the
+/// user's fill direction. Empty when there is no reading.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrayMeter {
+    pub bars: Vec<f32>,
+    /// Drawn faded: the reading is stale or missing.
+    pub dimmed: bool,
+}
+
+pub fn tray_meter(state: &PanelState, options: DisplayOptions) -> TrayMeter {
+    let bars = state
+        .snapshot
+        .as_ref()
+        .map(|snapshot| {
+            meter_windows(snapshot)
+                .map(|window| fill_fraction(window.used_percent, options.bar_fill))
+                .collect()
+        })
+        .unwrap_or_default();
+    TrayMeter {
+        bars,
+        dimmed: state.snapshot.is_none() || state.error.is_some(),
+    }
+}
+
+/// At most 127 UTF-16 units, the Windows notification-area tooltip limit.
+pub fn tray_tooltip(state: &PanelState, now: Timestamp, options: DisplayOptions) -> String {
+    let provider = provider_of(state);
+    let name = provider_name(provider);
+    let mut lines = Vec::new();
+    match &state.snapshot {
+        None => {
+            lines.push(format!("TokenBubble · {name}"));
+            lines.push(match &state.error {
+                Some(error) => short_message(provider, error),
+                None => "Loading…".to_owned(),
+            });
+        }
+        Some(snapshot) => {
+            lines.push(match snapshot.account.plan.as_deref() {
+                Some(plan) => format!("{name} · {}", plan_name(plan)),
+                None => name.to_owned(),
+            });
+            for window in meter_windows(snapshot) {
+                let mut line = format!(
+                    "{} {}",
+                    kind_label(window),
+                    percent_value(window.used_percent, options.bar_fill)
+                );
+                if let Some(reset) = window.resets_at {
+                    let remaining = reset.duration_since(now);
+                    if remaining > SignedDuration::ZERO {
+                        line.push_str(&format!(" · resets in {}", span(remaining)));
+                    }
+                }
+                lines.push(line);
+            }
+            lines.push(match &state.error {
+                Some(error) => format!("Couldn't refresh ({})", short_error(error)),
+                None => format!("Updated {}", ago(now.duration_since(snapshot.measured_at))),
+            });
+        }
+    }
+    truncate_utf16(&lines.join("\n"), 127)
+}
+
+fn truncate_utf16(text: &str, max_units: usize) -> String {
+    let mut units = 0;
+    let mut out = String::new();
+    for ch in text.chars() {
+        units += ch.len_utf16();
+        if units > max_units {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Account-wide session and weekly windows, else the first two account-wide windows.
+fn meter_windows(snapshot: &UsageSnapshot) -> impl Iterator<Item = &QuotaWindow> {
+    let account: Vec<&QuotaWindow> = snapshot
+        .windows
+        .iter()
+        .filter(|window| window.scope.is_none())
+        .collect();
+    let preferred: Vec<&QuotaWindow> = account
+        .iter()
+        .copied()
+        .filter(|window| matches!(window.kind, WindowKind::Session | WindowKind::Weekly))
+        .collect();
+    if preferred.is_empty() {
+        account
+    } else {
+        preferred
+    }
+    .into_iter()
+    .take(2)
+}
+
+fn provider_of(state: &PanelState) -> ProviderId {
+    state
+        .snapshot
+        .as_ref()
+        .map_or(ProviderId::Codex, |snapshot| snapshot.provider)
+}
+
 fn provider_name(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Codex => "Codex",
@@ -159,21 +327,20 @@ fn provider_name(provider: ProviderId) -> &'static str {
 
 /// `pro` → `Pro`, `free_workspace` → `Free workspace`.
 pub fn plan_name(raw: &str) -> String {
-    let spaced = raw.trim().replace(['_', '-'], " ");
-    let mut chars = spaced.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
+    capitalized(&raw.trim().replace(['_', '-'], " "))
 }
 
-fn bar(window: &QuotaWindow, now: Timestamp, tz: &TimeZone) -> BarView {
-    let kind = match (window.kind, window.duration_secs) {
+fn kind_label(window: &QuotaWindow) -> String {
+    match (window.kind, window.duration_secs) {
         (WindowKind::Session, _) => "Session".to_owned(),
         (WindowKind::Weekly, _) => "Weekly".to_owned(),
         (WindowKind::Other, Some(secs)) => format!("{} window", duration_label(secs)),
         (WindowKind::Other, None) => "Usage window".to_owned(),
-    };
+    }
+}
+
+fn bar(window: &QuotaWindow, now: Timestamp, tz: &TimeZone, options: DisplayOptions) -> BarView {
+    let kind = kind_label(window);
     let label = match &window.scope {
         Some(scope) => format!("{scope} · {kind}"),
         None => kind,
@@ -186,18 +353,34 @@ fn bar(window: &QuotaWindow, now: Timestamp, tz: &TimeZone) -> BarView {
     } else {
         Tone::Normal
     };
-    let value = if used > 100.0 {
-        format!("{} used · over limit", percent(used))
-    } else {
-        format!("{} used", percent(used))
-    };
+    let mut value = percent_value(used, options.bar_fill);
+    if used > 100.0 {
+        value.push_str(" · over limit");
+    }
     BarView {
         id: window.id.clone(),
         label,
         value,
-        fill: (used / 100.0).clamp(0.0, 1.0) as f32,
+        fill: fill_fraction(used, options.bar_fill),
         tone,
-        reset: window.resets_at.map(|at| reset_text(at, now, tz)),
+        reset: window
+            .resets_at
+            .map(|at| reset_text(at, now, tz, options.reset_display)),
+    }
+}
+
+fn fill_fraction(used_percent: f64, fill: BarFill) -> f32 {
+    let percent = match fill {
+        BarFill::Used => used_percent,
+        BarFill::Remaining => 100.0 - used_percent,
+    };
+    (percent / 100.0).clamp(0.0, 1.0) as f32
+}
+
+fn percent_value(used_percent: f64, fill: BarFill) -> String {
+    match fill {
+        BarFill::Used => format!("{} used", percent(used_percent)),
+        BarFill::Remaining => format!("{} left", percent((100.0 - used_percent).max(0.0))),
     }
 }
 
@@ -217,8 +400,8 @@ fn duration_label(secs: u64) -> String {
     }
 }
 
-/// `Resets in 5d 15h · Sat 12:44 PM`, in the viewer's time zone.
-pub fn reset_text(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
+/// `Resets in 5d 15h · Sun Oct 18 12:44 PM`, in the viewer's time zone.
+pub fn reset_text(at: Timestamp, now: Timestamp, tz: &TimeZone, display: ResetDisplay) -> String {
     let remaining = at.duration_since(now);
     if remaining <= SignedDuration::ZERO {
         return "Reset due".to_owned();
@@ -233,7 +416,11 @@ pub fn reset_text(at: Timestamp, now: Timestamp, tz: &TimeZone) -> String {
     } else {
         format!("{} {clock}", local.strftime("%a %b %-d"))
     };
-    format!("Resets in {} · {when}", span(remaining))
+    match display {
+        ResetDisplay::Both => format!("Resets in {} · {when}", span(remaining)),
+        ResetDisplay::Countdown => format!("Resets in {}", span(remaining)),
+        ResetDisplay::Clock => format!("Resets {when}"),
+    }
 }
 
 fn span(duration: SignedDuration) -> String {
@@ -300,10 +487,14 @@ fn amount(value: f64) -> String {
     }
 }
 
+fn cli_name(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Codex => "codex",
+    }
+}
+
 fn error_message(provider: ProviderId, error: &CollectError) -> String {
-    let (name, cli) = match provider {
-        ProviderId::Codex => ("Codex", "codex"),
-    };
+    let (name, cli) = (provider_name(provider), cli_name(provider));
     match error {
         CollectError::AuthRequired {
             reason: AuthReason::Expired,
@@ -316,7 +507,24 @@ fn error_message(provider: ProviderId, error: &CollectError) -> String {
         CollectError::CredentialsMissing { .. } => {
             format!("{name} isn't signed in on this computer. Run “{cli} login”, then refresh.")
         }
+        CollectError::NoUsageData => {
+            format!("{name} didn't report any usage limits for this account.")
+        }
         other => capitalized(&other.to_string()),
+    }
+}
+
+/// One tooltip line.
+fn short_message(provider: ProviderId, error: &CollectError) -> String {
+    let cli = cli_name(provider);
+    match error {
+        CollectError::AuthRequired {
+            reason: AuthReason::Expired,
+        } => format!("Sign-in expired · run “{cli}”"),
+        CollectError::AuthRequired { .. } | CollectError::CredentialsMissing { .. } => {
+            format!("Not signed in · run “{cli} login”")
+        }
+        other => capitalized(&short_error(other)),
     }
 }
 

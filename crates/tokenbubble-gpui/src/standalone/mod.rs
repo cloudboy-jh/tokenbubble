@@ -1,5 +1,5 @@
 //! Standalone host. On Windows TokenBubble lives in the notification area: the tray icon
-//! shows a two-bar meter and opens the shared panel as a flyout. Elsewhere, until the
+//! uses Windows' bubbles emoji and opens the shared panel as a flyout. Elsewhere, until the
 //! macOS menu-bar host exists, the panel opens in a plain window.
 
 mod popup;
@@ -16,8 +16,9 @@ use gpui::{
 };
 use jiff::Timestamp;
 use tokenbubble_core::config::Settings;
-use tokenbubble_core::model::UsageSnapshot;
+use tokenbubble_core::model::{ProviderId, UsageSnapshot};
 use tokenbubble_core::providers::CollectError;
+use tokenbubble_core::providers::claude::{self, ClaudeSource};
 use tokenbubble_core::providers::codex::{self, CodexSource};
 use tokenbubble_core::service::Schedule;
 use tokenbubble_core::transport::HttpTransport;
@@ -123,7 +124,113 @@ fn settings_path() -> Option<PathBuf> {
 struct TrayState {
     tray: windows::Tray,
     /// What the icon currently shows, to skip redundant updates.
-    shown: Option<(crate::presentation::TrayMeter, String, bool, u32)>,
+    shown: Option<(String, u32)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CollectionRequest {
+    provider: ProviderId,
+    generation: u64,
+}
+
+struct ProviderSchedule {
+    schedule: Schedule,
+    in_flight: Option<u64>,
+    last_success: Option<Instant>,
+}
+
+/// One request per provider; selection generations prevent A → B → A stale completions.
+/// Schedules stay with their provider so switching cannot bypass a rate-limit cooldown.
+struct Collections {
+    selected: ProviderId,
+    generation: u64,
+    providers: [ProviderSchedule; 2],
+    pending_selection: bool,
+}
+
+impl Collections {
+    fn new(selected: ProviderId, interval: Option<Duration>) -> Self {
+        Self {
+            selected,
+            generation: 0,
+            providers: ProviderId::ALL.map(|_| ProviderSchedule {
+                schedule: Schedule::new(interval),
+                in_flight: None,
+                last_success: None,
+            }),
+            pending_selection: true,
+        }
+    }
+
+    fn index(provider: ProviderId) -> usize {
+        match provider {
+            ProviderId::Codex => 0,
+            ProviderId::Claude => 1,
+        }
+    }
+
+    fn current(&self) -> &ProviderSchedule {
+        &self.providers[Self::index(self.selected)]
+    }
+
+    fn select(&mut self, provider: ProviderId) {
+        if self.selected != provider {
+            self.selected = provider;
+            self.generation = self.generation.wrapping_add(1);
+            self.pending_selection = true;
+        }
+    }
+
+    fn set_interval(&mut self, interval: Option<Duration>) {
+        for provider in &mut self.providers {
+            provider.schedule.set_interval(interval);
+        }
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.current().schedule.is_due(now)
+            || (self.pending_selection && self.current().schedule.may_start(now))
+    }
+
+    fn start(&mut self, now: Instant) -> Option<CollectionRequest> {
+        let current = &mut self.providers[Self::index(self.selected)];
+        if current.in_flight.is_some() || !current.schedule.may_start(now) {
+            return None;
+        }
+        current.in_flight = Some(self.generation);
+        current.schedule.started(now);
+        self.pending_selection = false;
+        Some(CollectionRequest {
+            provider: self.selected,
+            generation: self.generation,
+        })
+    }
+
+    /// Always record cooldowns, but only publish a result for the current selection.
+    fn finish(
+        &mut self,
+        request: CollectionRequest,
+        result: &Result<UsageSnapshot, CollectError>,
+        now: Instant,
+    ) -> bool {
+        let provider = &mut self.providers[Self::index(request.provider)];
+        if provider.in_flight != Some(request.generation) {
+            return false;
+        }
+        provider.in_flight = None;
+        match result {
+            Ok(_) => {
+                provider.schedule.succeeded();
+                provider.last_success = Some(now);
+            }
+            Err(error) => provider.schedule.failed(now, error),
+        }
+        let current = request.provider == self.selected && request.generation == self.generation;
+        if request.provider == self.selected && !current {
+            self.pending_selection = true;
+        }
+        current
+    }
 }
 
 struct Host {
@@ -131,9 +238,7 @@ struct Host {
     settings_path: Option<PathBuf>,
     settings_problem: Option<String>,
     panel: Entity<UsagePanel>,
-    schedule: Schedule,
-    in_flight: bool,
-    last_success: Option<Instant>,
+    collections: Collections,
     last_redraw: Instant,
     popup: Option<WindowHandle<PopupView>>,
     popup_closed_at: Option<Instant>,
@@ -154,11 +259,16 @@ impl Host {
         cx: &mut Context<Self>,
     ) -> Self {
         let options = DisplayOptions::from(&settings);
-        let panel = cx.new(|_| UsagePanel::new(PanelTheme::dark(), options));
+        let panel = cx.new(|_| UsagePanel::new(settings.provider, PanelTheme::dark(), options));
         let subscriptions = vec![
             cx.subscribe(&panel, |host, _, event, cx| match event {
                 PanelEvent::RefreshRequested => host.refresh(cx),
                 PanelEvent::SettingsRequested => host.open_settings(Section::General, cx),
+                PanelEvent::ProviderSelected(provider) => {
+                    let mut settings = host.settings.clone();
+                    settings.provider = *provider;
+                    host.apply_settings(settings, cx);
+                }
             }),
             cx.observe(&panel, |host, _, cx| host.sync_tray(cx)),
         ];
@@ -171,13 +281,11 @@ impl Host {
             }
         });
         let mut host = Self {
-            schedule: Schedule::new(settings.refresh.duration()),
+            collections: Collections::new(settings.provider, settings.refresh.duration()),
             settings,
             settings_path,
             settings_problem,
             panel,
-            in_flight: false,
-            last_success: None,
             last_redraw: Instant::now(),
             popup: None,
             popup_closed_at: None,
@@ -195,7 +303,7 @@ impl Host {
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        if self.schedule.is_due(now) {
+        if self.collections.is_due(now) {
             self.refresh(cx);
         }
         if now.duration_since(self.last_redraw) >= REDRAW {
@@ -207,36 +315,33 @@ impl Host {
     /// Start one collection unless one is running or the provider asked us to wait.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        if self.in_flight || !self.schedule.may_start(now) {
+        let Some(request) = self.collections.start(now) else {
             return;
-        }
-        self.in_flight = true;
-        self.schedule.started(now);
+        };
         self.panel.update(cx, |panel, cx| panel.begin_refresh(cx));
         cx.spawn(async move |host, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { collect_codex() })
+                .spawn(async move { collect(request.provider) })
                 .await;
-            let _ = host.update(cx, |host, cx| host.finish_refresh(result, cx));
+            let _ = host.update(cx, |host, cx| host.finish_refresh(request, result, cx));
         })
         .detach();
     }
 
     fn finish_refresh(
         &mut self,
+        request: CollectionRequest,
         result: Result<UsageSnapshot, CollectError>,
         cx: &mut Context<Self>,
     ) {
-        self.in_flight = false;
-        match &result {
-            Ok(_) => {
-                self.schedule.succeeded();
-                self.last_success = Some(Instant::now());
-            }
-            Err(error) => self.schedule.failed(Instant::now(), error),
+        if self.collections.finish(request, &result, Instant::now()) {
+            self.panel.update(cx, |panel, cx| panel.apply(result, cx));
+        } else if request.provider == self.settings.provider {
+            // A → B → A coalesces with the old A request, then fetches a fresh reading.
+            self.refresh(cx);
+            self.show_cooldown(cx);
         }
-        self.panel.update(cx, |panel, cx| panel.apply(result, cx));
     }
 
     fn open_popup(&mut self, anchor: Option<(i32, i32)>, cx: &mut Context<Self>) {
@@ -302,6 +407,8 @@ impl Host {
             Err(error) => eprintln!("TokenBubble could not open its panel: {error}"),
         }
         let stale = self
+            .collections
+            .current()
             .last_success
             .is_none_or(|success| success.elapsed() >= FRESH_ON_OPEN);
         if self.settings.refresh_on_open && stale {
@@ -348,9 +455,12 @@ impl Host {
                         .as_ref()
                         .map(|path| path.display().to_string()),
                     settings_problem: self.settings_problem.clone(),
-                    codex_home: CodexSource::from_env()
+                    codex_credentials: CodexSource::from_env()
                         .ok()
-                        .map(|source| source.codex_home.display().to_string()),
+                        .map(|source| source.codex_home.join("auth.json").display().to_string()),
+                    claude_credentials: ClaudeSource::from_env()
+                        .ok()
+                        .map(|source| source.credential_path().display().to_string()),
                 },
                 cx,
             );
@@ -402,10 +512,16 @@ impl Host {
     }
 
     fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
-        self.schedule.set_interval(settings.refresh.duration());
+        let switched = settings.provider != self.settings.provider;
+        self.collections.set_interval(settings.refresh.duration());
+        self.collections.select(settings.provider);
         let options = DisplayOptions::from(&settings);
         self.panel
             .update(cx, |panel, cx| panel.set_options(options, cx));
+        if switched {
+            self.panel
+                .update(cx, |panel, cx| panel.set_provider(settings.provider, cx));
+        }
         let problem = match &self.settings_path {
             Some(path) => settings
                 .save(path)
@@ -414,8 +530,33 @@ impl Host {
             None => self.settings_problem.clone(),
         };
         self.settings = settings;
+        if let Some((_, view)) = &self.settings_window {
+            view.update(cx, |view, cx| view.set_settings(self.settings.clone(), cx));
+        }
+        if switched {
+            self.refresh(cx);
+            self.show_cooldown(cx);
+        }
         self.report_settings_problem(problem, cx);
         self.sync_tray(cx);
+    }
+
+    fn show_cooldown(&mut self, cx: &mut Context<Self>) {
+        if let Some(remaining) = self
+            .collections
+            .current()
+            .schedule
+            .cooldown_remaining(Instant::now())
+        {
+            self.panel.update(cx, |panel, cx| {
+                panel.apply(
+                    Err(CollectError::RateLimited {
+                        retry_after: Some(remaining),
+                    }),
+                    cx,
+                );
+            });
+        }
     }
 
     fn report_settings_problem(&mut self, problem: Option<String>, cx: &mut Context<Self>) {
@@ -472,25 +613,22 @@ impl Host {
         }
     }
 
-    /// Redraw the tray icon and tooltip when what they show changed.
+    /// Update the tooltip when readings change; the bubbles icon stays recognizable.
     #[cfg(windows)]
     fn sync_tray(&mut self, cx: &mut Context<Self>) {
-        use crate::presentation::{tray_meter, tray_tooltip};
+        use crate::presentation::tray_tooltip;
         let Some(state) = &mut self.tray else {
             return;
         };
         let options = DisplayOptions::from(&self.settings);
         let panel_state = self.panel.read(cx).state();
-        let meter = tray_meter(panel_state, options);
         let tooltip = tray_tooltip(panel_state, Timestamp::now(), options);
-        let light = windows::taskbar_is_light();
         let icon_size = windows::Tray::icon_size();
-        let next = (meter, tooltip, light, icon_size);
+        let next = (tooltip, icon_size);
         if state.shown.as_ref() == Some(&next) {
             return;
         }
-        let pixels = crate::meter_icon::render(icon_size, &next.0, light);
-        match state.tray.set(&pixels, icon_size, &next.1) {
+        match state.tray.set(icon_size, &next.0) {
             Ok(()) => state.shown = Some(next),
             Err(error) => eprintln!("TokenBubble could not update its tray icon: {error}"),
         }
@@ -508,7 +646,96 @@ fn start_at_login() -> Option<bool> {
 }
 
 /// Blocking; runs on the background executor.
-fn collect_codex() -> Result<UsageSnapshot, CollectError> {
-    let source = CodexSource::from_env()?;
-    codex::collect(&source, &HttpTransport::default(), Timestamp::now())
+fn collect(provider: ProviderId) -> Result<UsageSnapshot, CollectError> {
+    let transport = HttpTransport::default();
+    let now = Timestamp::now();
+    match provider {
+        ProviderId::Codex => codex::collect(&CodexSource::from_env()?, &transport, now),
+        ProviderId::Claude => claude::collect(&ClaudeSource::from_env()?, &transport, now),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure() -> Result<UsageSnapshot, CollectError> {
+        Err(CollectError::NoUsageData)
+    }
+
+    #[test]
+    fn concurrent_refresh_requests_are_coalesced_per_provider() {
+        let now = Instant::now();
+        let mut collections = Collections::new(ProviderId::Codex, None);
+        let codex = collections.start(now).unwrap();
+        assert!(collections.start(now).is_none());
+        collections.select(ProviderId::Claude);
+        let claude = collections.start(now).unwrap();
+        assert!(collections.start(now).is_none());
+        assert!(!collections.finish(codex, &failure(), now));
+        assert!(collections.finish(claude, &failure(), now));
+    }
+
+    #[test]
+    fn rapid_round_trip_ignores_old_completion_and_requests_a_fresh_reading() {
+        let now = Instant::now();
+        let mut collections = Collections::new(ProviderId::Codex, None);
+        let old_codex = collections.start(now).unwrap();
+        collections.select(ProviderId::Claude);
+        let claude = collections.start(now).unwrap();
+        collections.select(ProviderId::Codex);
+        assert!(
+            collections.start(now).is_none(),
+            "old Codex request is still running"
+        );
+        assert!(!collections.finish(old_codex, &failure(), now));
+        assert!(
+            collections.is_due(now),
+            "selection refresh also runs in manual mode"
+        );
+        let new_codex = collections.start(now).unwrap();
+        assert_ne!(old_codex, new_codex);
+        assert!(!collections.finish(claude, &failure(), now));
+        assert!(collections.finish(new_codex, &failure(), now));
+        assert!(!collections.is_due(now));
+    }
+
+    #[test]
+    fn stale_rate_limit_survives_switching_and_does_not_block_the_other_provider() {
+        let now = Instant::now();
+        let wait = Duration::from_secs(120);
+        let rate_limit = Err(CollectError::RateLimited {
+            retry_after: Some(wait),
+        });
+        let mut collections = Collections::new(ProviderId::Codex, None);
+        let codex = collections.start(now).unwrap();
+        collections.select(ProviderId::Claude);
+        assert!(!collections.finish(codex, &rate_limit, now));
+        assert!(
+            collections.start(now).is_some(),
+            "Claude has its own cooldown"
+        );
+        collections.select(ProviderId::Codex);
+        assert!(collections.start(now).is_none());
+        assert!(!collections.is_due(now));
+        assert!(collections.is_due(now + wait));
+        assert!(collections.start(now + wait).is_some());
+    }
+
+    #[test]
+    fn current_rate_limit_and_interval_changes_preserve_cooldown() {
+        let now = Instant::now();
+        let wait = Duration::from_secs(120);
+        let rate_limit = Err(CollectError::RateLimited {
+            retry_after: Some(wait),
+        });
+        let mut collections = Collections::new(ProviderId::Claude, None);
+        let claude = collections.start(now).unwrap();
+        assert!(collections.finish(claude, &rate_limit, now));
+        collections.select(ProviderId::Codex);
+        collections.set_interval(Some(Duration::from_secs(60)));
+        collections.select(ProviderId::Claude);
+        assert!(collections.start(now + Duration::from_secs(119)).is_none());
+        assert!(collections.start(now + wait).is_some());
+    }
 }

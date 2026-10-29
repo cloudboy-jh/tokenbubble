@@ -1,5 +1,4 @@
-//! Renderer-independent panel state and everything it displays: panel text, the tray
-//! tooltip, and the tray meter's bar fractions.
+//! Renderer-independent panel state, panel text, and the tray tooltip.
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
@@ -12,6 +11,8 @@ use tokenbubble_core::providers::{AuthReason, CollectError};
 /// What the panel knows: the last good reading and the outcome of the latest attempt.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelState {
+    /// Selected source, including before its first successful reading.
+    pub provider: ProviderId,
     pub snapshot: Option<UsageSnapshot>,
     /// Set when the most recent collection failed.
     pub error: Option<CollectError>,
@@ -19,6 +20,15 @@ pub struct PanelState {
 }
 
 impl PanelState {
+    pub fn select_provider(&mut self, provider: ProviderId) {
+        if self.provider != provider {
+            *self = Self {
+                provider,
+                ..Self::default()
+            };
+        }
+    }
+
     pub fn begin_refresh(&mut self) {
         self.refreshing = true;
     }
@@ -27,6 +37,12 @@ impl PanelState {
     /// stale); sign-in and configuration failures drop it, because it may no longer
     /// describe the account the credentials now belong to.
     pub fn apply(&mut self, result: Result<UsageSnapshot, CollectError>) {
+        if result
+            .as_ref()
+            .is_ok_and(|snapshot| snapshot.provider != self.provider)
+        {
+            return;
+        }
         self.refreshing = false;
         match result {
             Ok(snapshot) => {
@@ -122,9 +138,9 @@ pub fn present(
     tz: &TimeZone,
     options: DisplayOptions,
 ) -> PanelView {
-    let provider = provider_of(state);
+    let provider = state.provider;
     let mut view = PanelView {
-        title: provider_name(provider),
+        title: provider.label(),
         plan: None,
         account: None,
         body: Body::Loading,
@@ -180,8 +196,8 @@ pub fn present(
 pub fn preferred_height(view: &PanelView) -> f32 {
     const PADDING: f32 = 32.0;
     const SECTION_GAP: f32 = 16.0;
-    /// 16 px title, 2 px gap, 12 px account line.
-    const HEADER: f32 = 48.0;
+    /// Title/account header plus the provider buttons and their section gap.
+    const HEADER: f32 = 94.0;
     /// Border, 12 px padding, 30 px buttons.
     const FOOTER: f32 = 44.0;
     const LINE: f32 = 21.0;
@@ -212,35 +228,10 @@ pub fn preferred_height(view: &PanelView) -> f32 {
     PADDING + HEADER + SECTION_GAP + body + money + SECTION_GAP + FOOTER
 }
 
-/// Fractions for the tray meter: session on top, weekly below, each `0.0..=1.0` in the
-/// user's fill direction. Empty when there is no reading.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TrayMeter {
-    pub bars: Vec<f32>,
-    /// Drawn faded: the reading is stale or missing.
-    pub dimmed: bool,
-}
-
-pub fn tray_meter(state: &PanelState, options: DisplayOptions) -> TrayMeter {
-    let bars = state
-        .snapshot
-        .as_ref()
-        .map(|snapshot| {
-            meter_windows(snapshot)
-                .map(|window| fill_fraction(window.used_percent, options.bar_fill))
-                .collect()
-        })
-        .unwrap_or_default();
-    TrayMeter {
-        bars,
-        dimmed: state.snapshot.is_none() || state.error.is_some(),
-    }
-}
-
 /// At most 127 UTF-16 units, the Windows notification-area tooltip limit.
 pub fn tray_tooltip(state: &PanelState, now: Timestamp, options: DisplayOptions) -> String {
-    let provider = provider_of(state);
-    let name = provider_name(provider);
+    let provider = state.provider;
+    let name = provider.label();
     let mut lines = Vec::new();
     match &state.snapshot {
         None => {
@@ -310,19 +301,6 @@ fn meter_windows(snapshot: &UsageSnapshot) -> impl Iterator<Item = &QuotaWindow>
     }
     .into_iter()
     .take(2)
-}
-
-fn provider_of(state: &PanelState) -> ProviderId {
-    state
-        .snapshot
-        .as_ref()
-        .map_or(ProviderId::Codex, |snapshot| snapshot.provider)
-}
-
-fn provider_name(provider: ProviderId) -> &'static str {
-    match provider {
-        ProviderId::Codex => "Codex",
-    }
 }
 
 /// `pro` → `Pro`, `free_workspace` → `Free workspace`.
@@ -461,10 +439,17 @@ fn money_rows(credits: Option<&Credits>, spend: Option<&SpendLimit>) -> Vec<Mone
         }
     }
     if let Some(spend) = spend {
+        let spend_amount = |value| match spend.currency.as_deref() {
+            None => amount(value),
+            Some("USD") => format!("${value:.2}"),
+            Some(currency) => format!("{currency} {value:.2}"),
+        };
         let value = match (spend.used, spend.limit, spend.remaining_percent) {
-            (Some(used), Some(limit), _) => Some(format!("{} of {}", amount(used), amount(limit))),
-            (None, Some(limit), _) => Some(format!("Limit {}", amount(limit))),
-            (Some(used), None, _) => Some(format!("{} used", amount(used))),
+            (Some(used), Some(limit), _) => {
+                Some(format!("{} of {}", spend_amount(used), spend_amount(limit)))
+            }
+            (None, Some(limit), _) => Some(format!("Limit {}", spend_amount(limit))),
+            (Some(used), None, _) => Some(format!("{} used", spend_amount(used))),
             (None, None, Some(remaining)) => Some(format!("{} left", percent(remaining))),
             (None, None, None) => None,
         };
@@ -487,14 +472,23 @@ fn amount(value: f64) -> String {
     }
 }
 
-fn cli_name(provider: ProviderId) -> &'static str {
+fn renewal_command(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Codex => "codex",
+        ProviderId::Claude => "claude auth login",
+    }
+}
+
+fn login_command(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Codex => "codex login",
+        ProviderId::Claude => "claude auth login",
     }
 }
 
 fn error_message(provider: ProviderId, error: &CollectError) -> String {
-    let (name, cli) = (provider_name(provider), cli_name(provider));
+    let (name, cli) = (provider.label(), renewal_command(provider));
+    let login = login_command(provider);
     match error {
         CollectError::AuthRequired {
             reason: AuthReason::Expired,
@@ -503,9 +497,9 @@ fn error_message(provider: ProviderId, error: &CollectError) -> String {
         }
         CollectError::AuthRequired {
             reason: AuthReason::Rejected,
-        } => format!("{name} rejected the stored sign-in. Run “{cli} login”, then refresh."),
+        } => format!("{name} rejected the stored sign-in. Run “{login}”, then refresh."),
         CollectError::CredentialsMissing { .. } => {
-            format!("{name} isn't signed in on this computer. Run “{cli} login”, then refresh.")
+            format!("{name} isn't signed in on this computer. Run “{login}”, then refresh.")
         }
         CollectError::NoUsageData => {
             format!("{name} didn't report any usage limits for this account.")
@@ -516,13 +510,14 @@ fn error_message(provider: ProviderId, error: &CollectError) -> String {
 
 /// One tooltip line.
 fn short_message(provider: ProviderId, error: &CollectError) -> String {
-    let cli = cli_name(provider);
+    let cli = renewal_command(provider);
+    let login = login_command(provider);
     match error {
         CollectError::AuthRequired {
             reason: AuthReason::Expired,
         } => format!("Sign-in expired · run “{cli}”"),
         CollectError::AuthRequired { .. } | CollectError::CredentialsMissing { .. } => {
-            format!("Not signed in · run “{cli} login”")
+            format!("Not signed in · run “{login}”")
         }
         other => capitalized(&short_error(other)),
     }

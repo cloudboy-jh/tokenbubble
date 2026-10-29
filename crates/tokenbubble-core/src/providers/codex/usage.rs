@@ -245,6 +245,7 @@ fn resolve_spend_limit(
         .flatten()
         .find_map(individual_limit)
         .map(|limit| SpendLimit {
+            currency: None,
             limit: limit.get("limit").and_then(lenient_number),
             used: limit.get("used").and_then(lenient_number),
             remaining_percent: ["remainingPercent", "remaining_percent"]

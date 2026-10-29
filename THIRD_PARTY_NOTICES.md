@@ -2,10 +2,11 @@
 
 ## CodexBar
 
-TokenBubble's Codex credential handling, usage request, and response normalization are adapted
-from CodexBar at commit `d554d44931807e568471c5ff0d7f786b9c33053b`
-(<https://github.com/steipete/CodexBar>). Test fixtures under
-`crates/tokenbubble-core/tests/fixtures/codex/` are adapted from CodexBar's test payloads.
+TokenBubble's Codex and Claude credential handling, usage requests, and response mapping
+are adapted from CodexBar at commit `d554d44931807e568471c5ff0d7f786b9c33053b`
+(<https://github.com/steipete/CodexBar>). Codex test fixtures under
+`crates/tokenbubble-core/tests/fixtures/codex/` are adapted from CodexBar's test payloads;
+Claude fixtures are synthetic and follow its documented response shapes.
 
 ```text
 MIT License
@@ -30,3 +31,15 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Provider artwork
+
+The embedded `crates/tokenbubble-gpui/assets/codex.png` and `claude.svg` are unmodified
+`Brand-ProviderIcon-codex.png` and `Brand-ProviderIcon-claude.svg` from the same pinned
+CodexBar commit. Their provenance and primary brand sources are recorded in
+[CodexBar's provider artwork notes](https://github.com/steipete/CodexBar/blob/d554d44931807e568471c5ff0d7f786b9c33053b/docs/provider-brand-icons.md).
+The Codex image is OpenAI's product artwork; the Claude mark uses Anthropic's documented
+orange (`#D97757`). Product names and marks remain the property of their respective owners.
+
+The Windows bubbles emoji is rendered from the user's installed Segoe UI Emoji font.
+TokenBubble does not redistribute the font or an extracted emoji asset.

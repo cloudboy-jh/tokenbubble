@@ -13,15 +13,34 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT,
     WPARAM,
 };
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1CreateFactory,
+    ID2D1Factory,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
+    IDWriteFactory,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BI_BITFIELDS, BITMAPINFO, BITMAPV5HEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
     DeleteObject, GetDC, GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     MonitorFromPoint, ReleaseDC,
 };
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+    WICBitmapCacheOnLoad,
+};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
-    RegSetKeyValueW,
+    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
@@ -92,6 +111,7 @@ fn send(event: TrayEvent) {
 pub struct Tray {
     hwnd: HWND,
     icon: Option<HICON>,
+    icon_size: u32,
     tooltip: String,
 }
 
@@ -129,6 +149,7 @@ impl Tray {
         Ok(Self {
             hwnd,
             icon: None,
+            icon_size: 0,
             tooltip: String::new(),
         })
     }
@@ -139,16 +160,19 @@ impl Tray {
         u32::try_from(size).unwrap_or(16).max(16)
     }
 
-    /// Replace the icon image (`size × size` BGRA, straight alpha) and tooltip.
-    pub fn set(&mut self, pixels: &[u8], size: u32, tooltip: &str) -> windows::core::Result<()> {
-        let icon = create_icon(pixels, size)?;
-        let previous = self.icon.replace(icon);
-        self.tooltip = tooltip.to_owned();
-        let result = self.publish(previous.is_none());
-        if let Some(previous) = previous {
-            let _ = unsafe { DestroyIcon(previous) };
+    /// Render Windows' native bubbles emoji only when the taskbar icon size changes.
+    pub fn set(&mut self, size: u32, tooltip: &str) -> windows::core::Result<()> {
+        let add = self.icon.is_none();
+        if add || self.icon_size != size {
+            let icon = create_icon(size)?;
+            if let Some(previous) = self.icon.replace(icon) {
+                let _ = unsafe { DestroyIcon(previous) };
+            }
+            self.icon_size = size;
         }
-        result
+        self.tooltip.clear();
+        self.tooltip.push_str(tooltip);
+        self.publish(add)
     }
 
     /// Add the icon again after Explorer restarts.
@@ -298,8 +322,72 @@ fn show_menu(hwnd: HWND, x: i32, y: i32) {
     }
 }
 
-fn create_icon(pixels: &[u8], size: u32) -> windows::core::Result<HICON> {
-    assert_eq!(pixels.len(), (size * size * 4) as usize);
+/// Rasterize the installed Segoe UI Emoji glyph, retaining its native color and alpha.
+fn create_icon(size: u32) -> windows::core::Result<HICON> {
+    // GPUI initializes OLE on this thread before creating the tray host.
+    let bitmap = unsafe {
+        let imaging: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let bitmap = imaging.CreateBitmap(
+            size,
+            size,
+            &GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapCacheOnLoad,
+        )?;
+        let drawing: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+        let target = drawing.CreateWicBitmapRenderTarget(
+            &bitmap,
+            &D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                ..Default::default()
+            },
+        )?;
+        let writing: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+        let format = writing.CreateTextFormat(
+            w!("Segoe UI Emoji"),
+            None,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            size as f32 * 0.9,
+            w!("en-US"),
+        )?;
+        format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        let brush = target.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+            None,
+        )?;
+        target.BeginDraw();
+        target.Clear(Some(&D2D1_COLOR_F::default()));
+        target.DrawText(
+            w!("\u{1FAE7}").as_wide(),
+            &format,
+            &D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: size as f32,
+                bottom: size as f32,
+            },
+            &brush,
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
+        target.EndDraw(None, None)?;
+        bitmap
+    };
     let side = size as i32;
     let header = BITMAPV5HEADER {
         bV5Size: size_of::<BITMAPV5HEADER>() as u32,
@@ -328,20 +416,28 @@ fn create_icon(pixels: &[u8], size: u32) -> windows::core::Result<HICON> {
         );
         ReleaseDC(None, dc);
         let color = color?;
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
-        // Monochrome rows are word-aligned. With a 32-bit alpha color bitmap the mask is
-        // unused, but it must exist and be defined.
-        let mask_bytes = vec![0u8; size.div_ceil(16) as usize * 2 * size as usize];
-        let mask = CreateBitmap(side, side, 1, 1, Some(mask_bytes.as_ptr() as *const c_void));
-        let info = ICONINFO {
-            fIcon: true.into(),
-            hbmMask: mask,
-            hbmColor: color,
-            ..Default::default()
-        };
-        let icon = CreateIconIndirect(&info);
+        let icon = (|| {
+            // Copy directly into the icon bitmap, without an intermediate pixel allocation.
+            bitmap.CopyPixels(
+                std::ptr::null(),
+                size * 4,
+                std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize),
+            )?;
+            let mask_bytes = vec![0u8; size.div_ceil(16) as usize * 2 * size as usize];
+            let mask = CreateBitmap(side, side, 1, 1, Some(mask_bytes.as_ptr() as *const c_void));
+            if mask.is_invalid() {
+                return Err(windows::core::Error::from_thread());
+            }
+            let icon = CreateIconIndirect(&ICONINFO {
+                fIcon: true.into(),
+                hbmMask: mask,
+                hbmColor: color,
+                ..Default::default()
+            });
+            let _ = DeleteObject(HGDIOBJ(mask.0));
+            icon
+        })();
         let _ = DeleteObject(HGDIOBJ(color.0));
-        let _ = DeleteObject(HGDIOBJ(mask.0));
         icon
     }
 }
@@ -357,24 +453,6 @@ pub fn bring_to_front(window: &gpui::Window) {
         let hwnd = HWND(handle.hwnd.get() as *mut c_void);
         let _ = unsafe { SetForegroundWindow(hwnd) };
     }
-}
-
-/// Whether the taskbar uses the light theme (`SystemUsesLightTheme`).
-pub fn taskbar_is_light() -> bool {
-    let mut value: u32 = 0;
-    let mut size = size_of::<u32>() as u32;
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("SystemUsesLightTheme"),
-            RRF_RT_REG_DWORD,
-            None,
-            Some(&mut value as *mut u32 as *mut c_void),
-            Some(&mut size),
-        )
-    };
-    status.is_ok() && value == 1
 }
 
 /// Held for the process lifetime; a second launch finds it and reveals this instance.

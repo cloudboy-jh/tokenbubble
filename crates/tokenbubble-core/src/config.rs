@@ -4,6 +4,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::model::ProviderId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +83,7 @@ pub enum ResetDisplay {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub provider: ProviderId,
     pub refresh: RefreshInterval,
     /// Collect when the panel opens if the reading is older than a minute.
     pub refresh_on_open: bool,
@@ -93,6 +95,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            provider: ProviderId::default(),
             refresh: RefreshInterval::default(),
             refresh_on_open: true,
             bar_fill: BarFill::default(),

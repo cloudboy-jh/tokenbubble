@@ -11,18 +11,20 @@ use gpui::{
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use tokenbubble_core::model::UsageSnapshot;
+use tokenbubble_core::model::{ProviderId, UsageSnapshot};
 use tokenbubble_core::providers::CollectError;
 
 use crate::presentation::{
     BarView, Body, DisplayOptions, PanelState, PanelView, Tone, preferred_height, present,
 };
+use crate::provider_icon::provider_icon;
 use crate::theme::PanelTheme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelEvent {
     RefreshRequested,
     SettingsRequested,
+    ProviderSelected(ProviderId),
 }
 
 pub struct UsagePanel {
@@ -36,9 +38,12 @@ pub struct UsagePanel {
 impl EventEmitter<PanelEvent> for UsagePanel {}
 
 impl UsagePanel {
-    pub fn new(theme: PanelTheme, options: DisplayOptions) -> Self {
+    pub fn new(provider: ProviderId, theme: PanelTheme, options: DisplayOptions) -> Self {
         Self {
-            state: PanelState::default(),
+            state: PanelState {
+                provider,
+                ..PanelState::default()
+            },
             theme,
             options,
             copied: false,
@@ -51,6 +56,12 @@ impl UsagePanel {
 
     pub fn options(&self) -> DisplayOptions {
         self.options
+    }
+
+    pub fn set_provider(&mut self, provider: ProviderId, cx: &mut Context<Self>) {
+        self.state.select_provider(provider);
+        self.copied = false;
+        cx.notify();
     }
 
     pub fn begin_refresh(&mut self, cx: &mut Context<Self>) {
@@ -92,7 +103,7 @@ impl UsagePanel {
 impl Render for UsagePanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = self.view();
-        let theme = self.theme;
+        let theme = self.theme.for_provider(self.state.provider);
         div()
             .id("tokenbubble-panel")
             .size_full()
@@ -104,14 +115,42 @@ impl Render for UsagePanel {
             .bg(theme.background)
             .text_color(theme.text)
             .text_size(px(13.0))
-            .child(header(&view, &theme))
+            .child(header(&view, self.state.provider, &theme))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .children(ProviderId::ALL.map(|provider| {
+                        let selected = self.state.provider == provider;
+                        let id = match provider {
+                            ProviderId::Codex => "tokenbubble-provider-codex",
+                            ProviderId::Claude => "tokenbubble-provider-claude",
+                        };
+                        action(
+                            id,
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(provider_icon(provider, px(16.0)))
+                                .child(provider.label()),
+                            &theme,
+                        )
+                        .when(selected, |button| {
+                            button.border_color(theme.accent).text_color(theme.accent)
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(PanelEvent::ProviderSelected(provider));
+                        }))
+                    })),
+            )
             .child(body(&view, &theme, self.copied, cx))
             .children((!view.money.is_empty()).then(|| money(&view, &theme)))
             .child(footer(&view, &theme, cx))
     }
 }
 
-fn header(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
+fn header(view: &PanelView, provider: ProviderId, theme: &PanelTheme) -> impl IntoElement {
     div()
         .flex()
         .items_start()
@@ -125,8 +164,15 @@ fn header(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
                 .min_w_0()
                 .child(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
                         .text_size(px(16.0))
                         .font_weight(FontWeight::SEMIBOLD)
+                        .when(provider == ProviderId::Claude, |title| {
+                            title.text_color(theme.accent)
+                        })
+                        .child(provider_icon(provider, px(24.0)))
                         .child(view.title),
                 )
                 .children(view.account.clone().map(|account| {
@@ -276,7 +322,7 @@ fn money(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
 }
 
 /// A small bordered text button.
-fn action(id: &'static str, label: &'static str, theme: &PanelTheme) -> Stateful<gpui::Div> {
+fn action(id: &'static str, label: impl IntoElement, theme: &PanelTheme) -> Stateful<gpui::Div> {
     let hover = theme.surface;
     div()
         .id(id)

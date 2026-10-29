@@ -1,12 +1,25 @@
 //! Provider-neutral usage readings. Nothing here holds credential material.
 
 use jiff::Timestamp;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
+    #[default]
     Codex,
+    Claude,
+}
+
+impl ProviderId {
+    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+        }
+    }
 }
 
 /// One successful reading of a subscription's quota state.
@@ -77,6 +90,8 @@ pub struct Credits {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SpendLimit {
+    /// ISO currency code when reported; amounts are in major units, not cents.
+    pub currency: Option<String>,
     pub limit: Option<f64>,
     pub used: Option<f64>,
     pub remaining_percent: Option<f64>,

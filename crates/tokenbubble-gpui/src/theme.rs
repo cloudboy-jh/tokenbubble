@@ -1,4 +1,5 @@
 use gpui::{Rgba, rgb};
+use tokenbubble_core::model::ProviderId;
 
 use crate::presentation::Tone;
 
@@ -31,6 +32,13 @@ impl PanelTheme {
             critical: rgb(0xf06058),
             track: rgb(0x34343b),
         }
+    }
+
+    pub fn for_provider(mut self, provider: ProviderId) -> Self {
+        if provider == ProviderId::Claude {
+            self.accent = rgb(0xd97757);
+        }
+        self
     }
 
     pub fn tone(&self, tone: Tone) -> Rgba {

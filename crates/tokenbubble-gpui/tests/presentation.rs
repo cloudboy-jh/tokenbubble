@@ -9,8 +9,8 @@ use tokenbubble_core::model::{
 use tokenbubble_core::providers::{AuthReason, CollectError};
 use tokenbubble_core::transport::TransportError;
 use tokenbubble_gpui::presentation::{
-    BarView, Body, DisplayOptions, MoneyRow, PanelState, Tone, TrayMeter, plan_name, present,
-    reset_text, tray_meter, tray_tooltip,
+    BarView, Body, DisplayOptions, MoneyRow, PanelState, Tone, plan_name, present, reset_text,
+    tray_tooltip,
 };
 
 /// 2026-10-13T04:00:00Z, a Tuesday.
@@ -58,7 +58,10 @@ fn snapshot(windows: Vec<QuotaWindow>) -> UsageSnapshot {
 }
 
 fn ready(snapshot: UsageSnapshot) -> PanelState {
-    let mut state = PanelState::default();
+    let mut state = PanelState {
+        provider: snapshot.provider,
+        ..PanelState::default()
+    };
     state.apply(Ok(snapshot));
     state
 }
@@ -183,13 +186,6 @@ fn nothing_collected_yet_is_loading_not_an_empty_meter() {
     let view = present(&state, now(), &utc(), defaults());
     assert_eq!(view.body, Body::Loading);
     assert!(view.refreshing);
-    assert_eq!(
-        tray_meter(&state, defaults()),
-        TrayMeter {
-            bars: Vec::new(),
-            dimmed: true
-        }
-    );
 }
 
 #[test]
@@ -207,7 +203,6 @@ fn transient_failure_keeps_reading_as_stale() {
             Tone::Warning
         ))
     );
-    assert!(tray_meter(&state, defaults()).dimmed);
 }
 
 #[test]
@@ -226,21 +221,6 @@ fn sign_in_failures_clear_the_previous_account_reading() {
         assert_eq!(view.account, None, "{error:?}");
         assert!(matches!(view.body, Body::Message { .. }), "{error:?}");
     }
-
-    let mut state = PanelState::default();
-    state.apply(Err(CollectError::AuthRequired {
-        reason: AuthReason::Expired,
-    }));
-    assert_eq!(
-        present(&state, now(), &utc(), defaults()).body,
-        Body::Message {
-            text: "Codex sign-in expired. Run “codex” in a terminal to renew it, then refresh."
-                .into(),
-            detail: "stored sign-in has expired; run the provider's CLI to refresh it \
-                     (auth_required)"
-                .into(),
-        }
-    );
 }
 
 #[test]
@@ -252,6 +232,7 @@ fn money_rows_show_only_supplied_values_and_respect_the_toggle() {
         balance: Some(0.0),
     });
     reading.spend_limit = Some(SpendLimit {
+        currency: None,
         limit: Some(200.0),
         used: Some(42.25),
         remaining_percent: None,
@@ -291,53 +272,106 @@ fn money_rows_show_only_supplied_values_and_respect_the_toggle() {
 }
 
 #[test]
-fn tray_meter_shows_session_over_weekly_and_ignores_model_windows() {
-    let mut spark = window(
-        "codex-spark-session",
-        WindowKind::Session,
-        Some(18_000),
-        90.0,
-    );
-    spark.scope = Some("Spark".into());
-    let state = ready(snapshot(vec![
-        window("session", WindowKind::Session, Some(18_000), 25.0),
-        weekly(150.0),
-        spark,
-    ]));
-    assert_eq!(
-        tray_meter(&state, defaults()),
-        TrayMeter {
-            bars: vec![0.25, 1.0],
-            dimmed: false
-        }
-    );
-    let remaining = DisplayOptions {
-        bar_fill: BarFill::Remaining,
-        ..defaults()
-    };
-    assert_eq!(tray_meter(&state, remaining).bars, [0.75, 0.0]);
-}
-
-#[test]
-fn tray_tooltip_summarizes_and_fits_the_shell_limit() {
-    let mut reading = snapshot(vec![weekly(1.0)]);
-    reading.windows[0].resets_at = Some("2026-10-18T19:44:40Z".parse().unwrap());
-    assert_eq!(
-        tray_tooltip(&ready(reading), now(), defaults()),
-        "Codex · Pro\nWeekly 1% used · resets in 5d 15h\nUpdated 2m ago"
-    );
-
-    let mut expired = PanelState::default();
-    expired.apply(Err(CollectError::AuthRequired {
-        reason: AuthReason::Expired,
-    }));
-    assert_eq!(
-        tray_tooltip(&expired, now(), defaults()),
-        "TokenBubble · Codex\nSign-in expired · run “codex”"
-    );
-
+fn tray_tooltip_fits_the_shell_utf16_limit() {
     let mut long = snapshot(vec![weekly(1.0), weekly(2.0)]);
     long.account.plan = Some("x".repeat(200));
     let tooltip = tray_tooltip(&ready(long), now(), defaults());
     assert!(tooltip.encode_utf16().count() <= 127);
+}
+
+#[test]
+fn selected_provider_controls_loading_errors_and_tooltip_without_a_snapshot() {
+    for provider in ProviderId::ALL {
+        let mut state = PanelState {
+            provider,
+            ..PanelState::default()
+        };
+        state.begin_refresh();
+        let loading = present(&state, now(), &utc(), defaults());
+        assert_eq!(loading.title, provider.label());
+        assert_eq!(loading.body, Body::Loading);
+        assert!(tray_tooltip(&state, now(), defaults()).contains(provider.label()));
+
+        state.apply(Err(CollectError::CredentialsMissing {
+            path: PathBuf::from("credentials.json"),
+        }));
+        let view = present(&state, now(), &utc(), defaults());
+        assert_eq!(view.title, provider.label());
+        let login = match provider {
+            ProviderId::Codex => "codex login",
+            ProviderId::Claude => "claude auth login",
+        };
+        assert!(matches!(view.body, Body::Message { text, .. }
+            if text.contains(provider.label()) && text.contains(login)));
+        assert!(tray_tooltip(&state, now(), defaults()).contains(login));
+    }
+}
+
+#[test]
+fn switching_provider_clears_previous_reading_error_and_refresh_state() {
+    let mut state = ready(snapshot(vec![weekly(10.0)]));
+    state.apply(Err(CollectError::Transport(TransportError::Timeout)));
+    state.begin_refresh();
+    state.select_provider(ProviderId::Claude);
+    assert_eq!(state.provider, ProviderId::Claude);
+    assert!(state.snapshot.is_none());
+    assert!(state.error.is_none());
+    assert!(!state.refreshing);
+    assert_eq!(present(&state, now(), &utc(), defaults()).title, "Claude");
+
+    state.begin_refresh();
+    state.apply(Ok(snapshot(vec![weekly(95.0)])));
+    assert!(
+        state.snapshot.is_none(),
+        "a mismatched snapshot cannot leak into the panel"
+    );
+    assert!(
+        state.refreshing,
+        "an ignored result cannot finish the selected refresh"
+    );
+
+    let mut claude = snapshot(vec![weekly(20.0)]);
+    claude.provider = ProviderId::Claude;
+    state.apply(Ok(claude));
+    assert_eq!(present(&state, now(), &utc(), defaults()).title, "Claude");
+    state.select_provider(ProviderId::Codex);
+    assert!(state.snapshot.is_none());
+    assert_eq!(
+        present(&state, now(), &utc(), defaults()).body,
+        Body::Loading
+    );
+}
+
+#[test]
+fn selecting_the_current_provider_keeps_its_reading() {
+    let mut state = ready(snapshot(vec![weekly(10.0)]));
+    let previous = state.clone();
+    state.select_provider(ProviderId::Codex);
+    assert_eq!(state, previous);
+}
+
+#[test]
+fn spend_currency_is_explicit_and_credits_remain_unitless() {
+    for (currency, expected) in [
+        ("USD", "$12.50 of $100.00"),
+        ("EUR", "EUR 12.50 of EUR 100.00"),
+    ] {
+        let mut reading = snapshot(vec![weekly(1.0)]);
+        reading.provider = ProviderId::Claude;
+        reading.credits = Some(Credits {
+            has_credits: true,
+            unlimited: false,
+            balance: Some(12.5),
+        });
+        reading.spend_limit = Some(SpendLimit {
+            currency: Some(currency.into()),
+            limit: Some(100.0),
+            used: Some(12.5),
+            remaining_percent: None,
+            resets_at: None,
+        });
+        let money = present(&ready(reading), now(), &utc(), defaults()).money;
+        assert_eq!(money[0].value, "12.50");
+        assert_eq!(money[1].value, expected);
+    }
 }

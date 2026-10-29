@@ -7,9 +7,11 @@ use gpui::{
 };
 use jiff::Timestamp;
 use tokenbubble_core::config::{BarFill, RefreshInterval, ResetDisplay, Settings};
+use tokenbubble_core::model::ProviderId;
 
 use crate::panel::UsagePanel;
 use crate::presentation::plan_name;
+use crate::provider_icon::provider_icon;
 use crate::theme::PanelTheme;
 
 pub const REPOSITORY_URL: &str = "https://github.com/cloudboy-jh/tokenbubble";
@@ -26,18 +28,18 @@ pub enum SettingsEvent {
 pub enum Section {
     General,
     Display,
-    Codex,
+    Source,
     About,
 }
 
 impl Section {
-    const ALL: [Self; 4] = [Self::General, Self::Display, Self::Codex, Self::About];
+    const ALL: [Self; 4] = [Self::General, Self::Display, Self::Source, Self::About];
 
     fn label(self) -> &'static str {
         match self {
             Self::General => "General",
             Self::Display => "Display",
-            Self::Codex => "Codex",
+            Self::Source => "Source",
             Self::About => "About",
         }
     }
@@ -53,8 +55,9 @@ pub struct SettingsView {
     /// Where settings are stored, and why the last load or save failed.
     settings_location: Option<String>,
     settings_problem: Option<String>,
-    /// Shown as the Codex credential source.
-    codex_home: Option<String>,
+    /// Native credential file locations, never their contents.
+    codex_credentials: Option<String>,
+    claude_credentials: Option<String>,
     copied: bool,
     _panel: Subscription,
 }
@@ -68,12 +71,16 @@ pub struct SettingsInit {
     pub start_at_login: Option<bool>,
     pub settings_location: Option<String>,
     pub settings_problem: Option<String>,
-    pub codex_home: Option<String>,
+    pub codex_credentials: Option<String>,
+    pub claude_credentials: Option<String>,
 }
 
 impl SettingsView {
     pub fn new(init: SettingsInit, cx: &mut Context<Self>) -> Self {
-        let observed = cx.observe(&init.panel, |_, _, cx| cx.notify());
+        let observed = cx.observe(&init.panel, |view, _, cx| {
+            view.copied = false;
+            cx.notify();
+        });
         Self {
             settings: init.settings,
             panel: init.panel,
@@ -82,7 +89,8 @@ impl SettingsView {
             start_at_login: init.start_at_login,
             settings_location: init.settings_location,
             settings_problem: init.settings_problem,
-            codex_home: init.codex_home,
+            codex_credentials: init.codex_credentials,
+            claude_credentials: init.claude_credentials,
             copied: false,
             _panel: observed,
         }
@@ -121,11 +129,11 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = self.theme.for_provider(self.settings.provider);
         let content = match self.section {
             Section::General => self.general(cx).into_any_element(),
             Section::Display => self.display(cx).into_any_element(),
-            Section::Codex => self.codex(cx).into_any_element(),
+            Section::Source => self.source(cx).into_any_element(),
             Section::About => self.about(cx).into_any_element(),
         };
         div()
@@ -151,6 +159,9 @@ impl Render for SettingsView {
                         let hover = theme.track;
                         div()
                             .id(SharedString::from(format!("section-{}", section.label())))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
                             .px(px(10.0))
                             .py(px(6.0))
                             .rounded(px(6.0))
@@ -162,6 +173,10 @@ impl Render for SettingsView {
                                 item.text_color(theme.muted)
                                     .hover(move |style| style.bg(hover))
                             })
+                            .children(
+                                (section == Section::Source)
+                                    .then(|| provider_icon(self.settings.provider, px(16.0))),
+                            )
                             .child(section.label())
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 view.show_section(section, cx);
@@ -182,9 +197,20 @@ impl Render for SettingsView {
                     .gap(px(20.0))
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
                             .text_size(px(18.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.section.label()),
+                            .children(
+                                (self.section == Section::Source)
+                                    .then(|| provider_icon(self.settings.provider, px(24.0))),
+                            )
+                            .child(if self.section == Section::Source {
+                                self.settings.provider.label()
+                            } else {
+                                self.section.label()
+                            }),
                     )
                     .child(content),
             )
@@ -193,7 +219,15 @@ impl Render for SettingsView {
 
 impl SettingsView {
     fn general(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = self.theme.for_provider(self.settings.provider);
+        let provider = segmented(
+            "provider",
+            &ProviderId::ALL.map(|provider| (provider, provider.label())),
+            self.settings.provider,
+            &theme,
+            cx,
+            |view, provider, cx| view.change(|settings| settings.provider = provider, cx),
+        );
         let interval = segmented(
             "refresh-interval",
             &RefreshInterval::ALL.map(|interval| (interval, interval.label())),
@@ -214,6 +248,12 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap(px(18.0))
+            .child(row(
+                "Provider",
+                "Read the native CLI sign-in for this provider on this PC.",
+                provider,
+                &theme,
+            ))
             .child(row(
                 "Refresh automatically",
                 "How often TokenBubble asks for new usage. Manual only refreshes on request.",
@@ -253,7 +293,7 @@ impl SettingsView {
     }
 
     fn display(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = self.theme.for_provider(self.settings.provider);
         let fill = segmented(
             "bar-fill",
             &[(BarFill::Used, "Used"), (BarFill::Remaining, "Remaining")],
@@ -288,7 +328,7 @@ impl SettingsView {
             .gap(px(18.0))
             .child(row(
                 "Bars show",
-                "Fill bars and the tray meter with what you've used or what's left.",
+                "Fill usage bars with what you've used or what's left.",
                 fill,
                 &theme,
             ))
@@ -306,9 +346,21 @@ impl SettingsView {
             ))
     }
 
-    fn codex(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+    fn source(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme.for_provider(self.settings.provider);
         let state = self.panel.read(cx).state().clone();
+        let (credentials, description) = match state.provider {
+            ProviderId::Codex => (
+                &self.codex_credentials,
+                "Reads the sign-in Codex CLI stores on this PC. TokenBubble never signs \
+                 in, renews tokens, or changes Codex files.",
+            ),
+            ProviderId::Claude => (
+                &self.claude_credentials,
+                "Reads the Claude Code sign-in stored on this PC. TokenBubble never signs \
+                 in, renews tokens, or changes Claude files. Run “claude auth login” to sign in.",
+            ),
+        };
         let snapshot = state.snapshot.as_ref();
         let status = if state.refreshing {
             "Refreshing…".to_owned()
@@ -339,9 +391,9 @@ impl SettingsView {
         let info = [
             (
                 "Source",
-                Some(match &self.codex_home {
-                    Some(home) => format!("This PC · {home}"),
-                    None => "This PC".to_owned(),
+                Some(match credentials {
+                    Some(path) => format!("This PC · {path}"),
+                    None => "This PC · credential path unavailable".to_owned(),
                 }),
             ),
             (
@@ -360,14 +412,14 @@ impl SettingsView {
             .as_ref()
             .map(|error| format!("{} ({})", error, error.kind()));
         let refresh = if state.refreshing {
-            button("codex-refresh", "Refreshing…", &theme).text_color(theme.muted)
+            button("source-refresh", "Refreshing…", &theme).text_color(theme.muted)
         } else {
-            button("codex-refresh", "Refresh now", &theme)
+            button("source-refresh", "Refresh now", &theme)
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::RefreshRequested)))
         };
         let copy = error_detail.map(|detail| {
             button(
-                "codex-copy-error",
+                "source-copy-error",
                 if self.copied { "Copied" } else { "Copy error" },
                 &theme,
             )
@@ -385,10 +437,7 @@ impl SettingsView {
                 div()
                     .text_color(theme.muted)
                     .line_height(relative(1.4))
-                    .child(
-                        "Reads the sign-in Codex CLI stores on this PC. TokenBubble never signs \
-                         in, renews tokens, or changes Codex files.",
-                    ),
+                    .child(description),
             )
             .child(
                 div()
@@ -424,7 +473,7 @@ impl SettingsView {
     }
 
     fn about(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = self.theme.for_provider(self.settings.provider);
         div()
             .flex()
             .flex_col()

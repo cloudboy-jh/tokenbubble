@@ -8,12 +8,26 @@
 
 **Build order:** Standalone Windows app first, Compi integration second, native macOS qualification afterward. Get one real subscription working end to end before expanding providers.
 
+## Current version (2026-10-29)
+
+- Standalone Windows tray app with a shared GPUI panel, settings, manual/background refresh, and selectable Codex/Claude providers. The selection is saved; switching clears the old provider's display, ignores outdated requests, and preserves separate rate-limit cooldowns.
+- The Windows tray icon is the installed Segoe UI Emoji bubbles glyph, rendered in native color at the taskbar's icon size. Usage remains in the panel and tooltip instead of changing the icon into bars. Windows may place it under Show Hidden Icons.
+- Codex and Claude have embedded provider artwork in the panel header and selector, plus the settings source section. Claude uses its documented orange accent (`#D97757`); Codex keeps the existing accent and its blue/purple product artwork.
+- Run `cargo dev` from this repository in Windows PowerShell to build, launch, and rebuild on saved changes. Click the notification-area icon to open the panel; `q` then Enter stops the development runner. For a single launch, run `cargo run --locked -p tokenbubble-gpui --bin tokenbubble`.
+- Collection is read-only and uses the native CLI sign-in: Codex honors `CODEX_HOME` (default `~/.codex`); Claude honors `CLAUDE_CONFIG_DIR` (default `~/.claude`, `.credentials.json`). A Windows launch does not read WSL credentials. Neither collector refreshes tokens or changes CLI files.
+- One-shot commands: `cargo run --locked -p tokenbubble-core --bin tokenbubble-collect -- codex` or the same command ending in `claude`. Output contains usage or a classified error, never tokens.
+- Claude reports session, weekly, and supplied model/feature limits. Extra usage remains separate, with cents converted to major currency units. Missing identity or quota values are not invented.
+- Verified native Codex and Claude readings, notification icon publication, second-launch reveal, Escape dismissal without quitting, reopen, click-away, provider selection persistence, and explicit quit. Native screenshots also verified the bubbles emoji, both provider icons, orange Claude styling, and the settings source section. The expired-sign-in state was verified before the stored Claude login was renewed.
+- Native macOS Keychain behavior, multi-monitor/DPI changes, WSL source selection, and Compi integration remain unverified or unimplemented.
+- Windows workspace tests and Clippy pass. The original planning sections below describe the intended broader product, not completed work.
+
+
 ## Inspection and limits
 
 - Compi upstream and WSL HEAD: `919942a0e2e066f45f774464be52f31d0b53a5c3`.
 - Inspected working source: `/home/thatmfer/proj/compi`, including substantial uncommitted changes and an untracked `crates/compi-protocol/src/program_status.rs`. Implementation must reread touched files and preserve those changes. Do not replace the tree with upstream source.
 - CodexBar reference: `d554d44931807e568471c5ff0d7f786b9c33053b`.
-- Source inspection only. No builds, authenticated requests, credentials inspection, or native tray trials performed.
+- The original planning pass was source inspection only; subsequent runtime evidence is recorded above.
 - Current Compi roadmap still puts OSC 7501 next. This is an independent feature plan, not authorization to reorder that work.
 - Codex and Claude are the proposed first collectors, not a claim about the user's complete subscription list. Add other requested providers after inspecting their actual source and auth paths.
 

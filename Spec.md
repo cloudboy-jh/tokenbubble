@@ -29,6 +29,7 @@
 - Autostart remains opt-in. Enable it from the installed copy, or toggle it off/on there if an older development path was registered. Release builds have no development console and do not need Rust or `cargo dev` to run.
 - `.github/workflows/release-windows.yml` builds tags matching `v*` on Windows with Rust 1.99.0. It requires the tag to match the workspace version, checks formatting/tests/Clippy, runs the same packaging script, and publishes the ZIP and checksum. Tags containing `-` are published as prereleases.
 - To publish the next version, update `[workspace.package].version` and the workspace package entries in `Cargo.lock`, commit and push, then push the matching `v<version>` tag. Verify the workflow and download the release package before replacing an installed copy.
+- An existing unpublished tag can also be built explicitly with `gh workflow run release-windows.yml --ref main -f tag=v0.1.0-beta.1`. This leaves the tag unchanged and uses that tag's source.
 - These builds are unsigned; Windows may show a SmartScreen warning. No installer or automatic updater is included.
 
 ## Inspection and limits

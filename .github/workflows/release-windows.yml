@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-release-${{ github.ref }}
+  group: windows-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -17,12 +23,15 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
       - name: Install Rust
         run: |
@@ -37,8 +46,8 @@ jobs:
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $version = ($metadata.packages | Where-Object name -eq 'tokenbubble-gpui').version
-          if ($env:GITHUB_REF_NAME -ne "v$version") {
-            throw "Tag $env:GITHUB_REF_NAME does not match package version $version"
+          if ($env:RELEASE_TAG -ne "v$version") {
+            throw "Tag $env:RELEASE_TAG does not match package version $version"
           }
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -58,9 +67,9 @@ jobs:
           )
           $options = @(
             '--verify-tag',
-            '--title', "TokenBubble $env:GITHUB_REF_NAME",
+            '--title', "TokenBubble $env:RELEASE_TAG",
             '--notes-file', 'target/release-packages/release-notes.md'
           )
-          if ($env:GITHUB_REF_NAME.Contains('-')) { $options += '--prerelease' }
-          gh release create $env:GITHUB_REF_NAME @assets @options
+          if ($env:RELEASE_TAG.Contains('-')) { $options += '--prerelease' }
+          gh release create $env:RELEASE_TAG @assets @options
           exit $LASTEXITCODE

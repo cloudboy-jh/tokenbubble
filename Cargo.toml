@@ -4,7 +4,7 @@ members = ["crates/tokenbubble-core", "crates/tokenbubble-gpui", "tools/tokenbub
 default-members = ["crates/tokenbubble-core", "crates/tokenbubble-gpui"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2024"
 publish = false
 

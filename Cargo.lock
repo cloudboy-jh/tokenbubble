@@ -5224,7 +5224,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokenbubble-core"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "base64 0.22.1",
  "jiff",
@@ -5238,7 +5238,7 @@ dependencies = [
 
 [[package]]
 name = "tokenbubble-dev"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "libc",
  "serde_json",
@@ -5248,7 +5248,7 @@ dependencies = [
 
 [[package]]
 name = "tokenbubble-gpui"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-channel",
  "gpui-pre",

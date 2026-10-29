@@ -21,6 +21,15 @@
 - Native macOS Keychain behavior, multi-monitor/DPI changes, WSL source selection, and Compi integration remain unverified or unimplemented.
 - Windows workspace tests and Clippy pass. The original planning sections below describe the intended broader product, not completed work.
 
+## Installing and releasing Windows
+
+- The Windows prerelease version is `0.1.0-beta.1`. Build its ZIP with `powershell -ExecutionPolicy Bypass -File tools/package-windows.ps1` from the repository root using native Windows Rust.
+- Packages are written under `target/release-packages/`: a versioned Windows x64 ZIP, `SHA256SUMS.txt`, and release notes. The ZIP contains only `tokenbubble.exe`, `INSTALL.txt`, and `THIRD_PARTY_NOTICES.md`; provider images are embedded in the executable.
+- Keep an installed copy outside the checkout, for example `%LOCALAPPDATA%\Programs\TokenBubble`. Launch that executable directly. Update by quitting the tray app, replacing the executable with a verified release, and relaunching. Settings remain in `%APPDATA%\TokenBubble\settings.toml`; CLI credentials remain owned by their CLIs.
+- Autostart remains opt-in. Enable it from the installed copy, or toggle it off/on there if an older development path was registered. Release builds have no development console and do not need Rust or `cargo dev` to run.
+- `.github/workflows/release-windows.yml` builds tags matching `v*` on Windows with Rust 1.99.0. It requires the tag to match the workspace version, checks formatting/tests/Clippy, runs the same packaging script, and publishes the ZIP and checksum. Tags containing `-` are published as prereleases.
+- To publish the next version, update `[workspace.package].version` and the workspace package entries in `Cargo.lock`, commit and push, then push the matching `v<version>` tag. Verify the workflow and download the release package before replacing an installed copy.
+- These builds are unsigned; Windows may show a SmartScreen warning. No installer or automatic updater is included.
 
 ## Inspection and limits
 

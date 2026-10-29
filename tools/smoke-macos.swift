@@ -94,7 +94,9 @@ func visibleWindows() -> [[String: Any]] {
     let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
     return windows.filter { window in
         guard (window[kCGWindowOwnerPID as String] as? Int) == Int(pid),
-              (window[kCGWindowLayer as String] as? Int) == 0,
+              // GPUI uses level 101 for usage popups and level 0 for Settings.
+              let layer = window[kCGWindowLayer as String] as? Int,
+              layer == 0 || layer == 101,
               let bounds = window[kCGWindowBounds as String] as? [String: Any],
               let width = bounds["Width"] as? Double,
               let height = bounds["Height"] as? Double else { return false }

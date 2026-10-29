@@ -96,7 +96,6 @@ pub fn run() {
         {
             // A menu-bar host without a status item would become an invisible process.
             cx.quit();
-            return;
         }
         #[cfg(not(target_os = "macos"))]
         {

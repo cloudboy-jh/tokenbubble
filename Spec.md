@@ -19,7 +19,7 @@
 - Claude reports session, weekly, and supplied model/feature limits. Extra usage remains separate, with cents converted to major currency units. Missing identity or quota values are not invented.
 - Verified native Codex and Claude readings, notification icon publication, second-launch reveal, Escape dismissal without quitting, reopen, click-away, provider selection persistence, and explicit quit. Native screenshots also verified the bubbles emoji, both provider icons, orange Claude styling, and the settings source section. The expired-sign-in state was verified before the stored Claude login was renewed.
 - macOS uses a menu-bar-only app bundle, anchored usage flyout, native context menu, explicit quit, and LaunchServices reopen. Native account access, Keychain prompts, physical multi-monitor/DPI changes, WSL source selection, and Compi integration remain unverified or unimplemented.
-- Windows workspace tests and Clippy pass. The original planning sections below describe the intended broader product, not completed work.
+- Windows x64, macOS Apple Silicon, and macOS Intel workspace tests, formatting, Clippy, and release packaging passed in [native build 40959031991](https://github.com/cloudboy-jh/tokenbubble/actions/runs/40959031991). Both Mac bundles were extracted and launched on macOS 15.7.9; automation exercised the status item, usage panel, Escape dismissal, existing-instance reopen, native Settings, close, and Quit. Screenshots confirmed real rendering. Mac account collection was not exercised because the runners have no CLI sign-ins. The original planning sections below describe the intended broader product, not completed work.
 
 ## Installing and releasing
 

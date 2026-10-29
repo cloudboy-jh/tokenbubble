@@ -1,5 +1,5 @@
-//! The window that hosts the shared panel: a tray flyout on Windows, a plain window
-//! elsewhere until the macOS menu-bar host exists.
+//! The window hosting the shared panel: a notification-area/menu-bar flyout,
+//! or an ordinary window when no native host is available.
 
 use gpui::{
     Context, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, Styled,
@@ -22,6 +22,8 @@ impl PopupView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        #[cfg(target_os = "macos")]
+        window.set_window_title("TokenBubble Usage");
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let activation = dismiss_on_blur.then(|| {

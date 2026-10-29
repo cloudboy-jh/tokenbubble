@@ -53,22 +53,6 @@ from the project's GitHub releases and verify the ZIP against SHA256SUMS.txt:
         Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $archive -Force
         $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
         "$hash  $name.zip" | Set-Content (Join-Path $output 'SHA256SUMS.txt') -Encoding ASCII
-        @"
-## Windows x64
-
-Download **$name.zip**, extract it into a permanent folder, and run
-**tokenbubble.exe**. Look for the Windows bubbles emoji under **Show Hidden Icons**
-if it is not beside the clock. Installation and manual update instructions are
-included in **INSTALL.txt**. Enable **Start at sign-in** from the installed copy.
-
-- Codex and Claude subscription usage, read from their native Windows CLI sign-ins.
-- Provider selection, quota/reset displays, background refresh, and saved settings.
-- Native bubbles tray icon, provider artwork, and orange Claude styling.
-- No app-managed login, credential refresh, installer, or automatic updater.
-
-This Windows build is unsigned. Verify the downloaded ZIP with **SHA256SUMS.txt**.
-macOS and WSL source selection are not part of this release.
-"@ | Set-Content (Join-Path $output 'release-notes.md') -Encoding UTF8
         Write-Output "Package: $archive"
         Write-Output "SHA-256: $hash"
     }

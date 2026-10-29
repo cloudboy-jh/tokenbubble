@@ -1,10 +1,16 @@
-//! Standalone host. On Windows TokenBubble lives in the notification area: the tray icon
-//! uses Windows' bubbles emoji and opens the shared panel as a flyout. Elsewhere, until the
-//! macOS menu-bar host exists, the panel opens in a plain window.
+//! Standalone notification-area host on Windows and menu-bar host on macOS.
+//! Both native icons open the shared GPUI panel and settings.
 
+#[cfg(target_os = "macos")]
+mod macos;
 mod popup;
 #[cfg(windows)]
 mod windows;
+
+#[cfg(target_os = "macos")]
+use macos as native_tray;
+#[cfg(windows)]
+use windows as native_tray;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -59,8 +65,21 @@ pub fn run() {
 
     // The tray app keeps running with no windows; quitting is always explicit.
     let application = gpui_platform::application().with_quit_mode(QuitMode::Explicit);
+    #[cfg(target_os = "macos")]
+    let reopen_host = std::rc::Rc::new(std::cell::RefCell::new(None::<Entity<Host>>));
+    #[cfg(target_os = "macos")]
+    {
+        let reopen_host = reopen_host.clone();
+        application.on_reopen(move |cx| {
+            if let Some(host) = reopen_host.borrow().as_ref() {
+                host.update(cx, |host, cx| host.open_popup(None, cx));
+            }
+        });
+    }
     application.run(move |cx: &mut App| {
         let host = cx.new(|cx| Host::new(settings, settings_path, problem, cx));
+        #[cfg(target_os = "macos")]
+        reopen_host.replace(Some(host.clone()));
         let closed = host.clone();
         // Windows can close while the host is mid-update (it removes its own flyout), so the
         // bookkeeping runs after the current update instead of re-entering it.
@@ -69,29 +88,38 @@ pub fn run() {
             cx.defer(move |cx| closed.update(cx, |host, cx| host.window_closed(id, cx)));
         })
         .detach();
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if start_tray(host.clone(), cx) {
             return;
         }
-        // No tray: a plain window, and quitting when it closes.
-        host.update(cx, |host, cx| {
-            host.windowed = true;
-            host.open_popup(None, cx);
-        });
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
+        #[cfg(target_os = "macos")]
+        {
+            // A menu-bar host without a status item would become an invisible process.
+            cx.quit();
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // No tray: a plain window, and quitting when it closes.
+            host.update(cx, |host, cx| {
+                host.windowed = true;
+                host.open_popup(None, cx);
+            });
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+        }
     });
 }
 
 /// Returns false when the tray icon could not be created.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn start_tray(host: Entity<Host>, cx: &mut App) -> bool {
     let (sender, events) = async_channel::unbounded();
-    let tray = match windows::Tray::create(sender) {
+    let tray = match native_tray::Tray::create(sender) {
         Ok(tray) => tray,
         Err(error) => {
             eprintln!("TokenBubble could not create its tray icon: {error}");
@@ -125,6 +153,12 @@ struct TrayState {
     tray: windows::Tray,
     /// What the icon currently shows, to skip redundant updates.
     shown: Option<(String, u32)>,
+}
+
+#[cfg(target_os = "macos")]
+struct TrayState {
+    tray: macos::Tray,
+    shown: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +279,7 @@ struct Host {
     settings_window: Option<(WindowHandle<SettingsView>, Entity<SettingsView>)>,
     /// No tray: the panel is an ordinary window.
     windowed: bool,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     tray: Option<TrayState>,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
@@ -291,7 +325,7 @@ impl Host {
             popup_closed_at: None,
             settings_window: None,
             windowed: false,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             tray: None,
             _subscriptions: subscriptions,
             _ticker: ticker,
@@ -345,6 +379,8 @@ impl Host {
     }
 
     fn open_popup(&mut self, anchor: Option<(i32, i32)>, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        cx.activate(true);
         if let Some(popup) = self.popup {
             let _ = popup.update(cx, |_, window, _| window.activate_window());
             return;
@@ -361,7 +397,14 @@ impl Host {
         let placed = flyout
             .then(|| windows::popup_origin(anchor, POPUP_WIDTH, height))
             .flatten();
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        let placed = {
+            let _ = anchor;
+            self.tray
+                .as_ref()
+                .and_then(|state| state.tray.popup_origin(POPUP_WIDTH, height))
+        };
+        #[cfg(not(any(windows, target_os = "macos")))]
         let placed: Option<(u64, f32, f32)> = {
             let _ = anchor;
             None
@@ -437,6 +480,8 @@ impl Host {
     }
 
     fn open_settings(&mut self, section: Section, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        cx.activate(true);
         if let Some((window, view)) = &self.settings_window {
             view.update(cx, |view, cx| view.show_section(section, cx));
             let _ = window.update(cx, |_, window, _| window.activate_window());
@@ -613,6 +658,37 @@ impl Host {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn tray_event(&mut self, event: macos::TrayEvent, cx: &mut Context<Self>) {
+        match event {
+            macos::TrayEvent::Toggle => self.toggle_popup(None, cx),
+            macos::TrayEvent::Dismiss => self.close_popup(cx),
+            macos::TrayEvent::Refresh => self.refresh(cx),
+            macos::TrayEvent::Settings => self.open_settings(Section::General, cx),
+            macos::TrayEvent::About => self.open_settings(Section::About, cx),
+            macos::TrayEvent::Quit => {
+                self.tray = None;
+                cx.quit();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_tray(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.tray else {
+            return;
+        };
+        let tooltip = crate::presentation::tray_tooltip(
+            self.panel.read(cx).state(),
+            Timestamp::now(),
+            DisplayOptions::from(&self.settings),
+        );
+        if state.shown.as_ref() != Some(&tooltip) {
+            state.tray.set_tooltip(&tooltip);
+            state.shown = Some(tooltip);
+        }
+    }
+
     /// Update the tooltip when readings change; the bubbles icon stays recognizable.
     #[cfg(windows)]
     fn sync_tray(&mut self, cx: &mut Context<Self>) {
@@ -634,7 +710,7 @@ impl Host {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn sync_tray(&mut self, _: &mut Context<Self>) {}
 }
 

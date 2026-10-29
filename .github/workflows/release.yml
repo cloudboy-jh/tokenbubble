@@ -1,0 +1,187 @@
+name: Native builds and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable version tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: macos-aarch64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - platform: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+      BUILD_TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.99.0
+          rustup target add "$BUILD_TARGET"
+      - name: Verify immutable release source and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          python_command=python3
+          if [[ "$RUNNER_OS" == Windows ]]; then python_command=python; fi
+          "$python_command" - <<'PY'
+          import json, os, re, subprocess
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'metadata.json')) as f:
+              metadata = json.load(f)
+          version = next(p['version'] for p in metadata['packages'] if p['name'] == 'tokenbubble-gpui')
+          tag = os.environ['RELEASE_TAG']
+          if tag:
+              if not re.fullmatch(r'v[0-9][0-9A-Za-z.+-]*', tag) or tag != 'v' + version:
+                  raise SystemExit(f'Tag {tag!r} does not match workspace version {version}')
+              tagged = subprocess.check_output(['git', 'rev-parse', f'refs/tags/{tag}^{{commit}}'], text=True).strip()
+              head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              if tagged != head:
+                  raise SystemExit('Checkout is not the immutable tagged commit')
+          print(f'Building TokenBubble {version} from ' + (tag or 'main (artifacts only)'))
+          PY
+      - name: Verify native macOS architecture and Metal toolchain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$BUILD_TARGET" in
+            aarch64-*) test "$(uname -m)" = arm64 ;;
+            x86_64-*) test "$(uname -m)" = x86_64 ;;
+          esac
+          xcodebuild -version
+          xcrun --find metal
+          xcrun --find metallib
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+      - name: Check Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Package Windows x64
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tools/package-windows.ps1
+      - name: Package native macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash tools/package-macos.sh "$BUILD_TARGET"
+      - name: Launch and exercise packaged macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          diagnostics="$PWD/target/macos-smoke-diagnostics"
+          mkdir -p "$diagnostics" target/macos-smoke
+          archive=(target/release-packages/*-macos-*.zip)
+          ditto -x -k "${archive[0]}" target/macos-smoke
+          app="$PWD/target/macos-smoke/TokenBubble.app"
+          codesign --verify --deep --strict --verbose=2 "$app" 2> "$diagnostics/codesign.log"
+          open -n --stdout "$diagnostics/app.stdout.log" --stderr "$diagnostics/app.stderr.log" "$app"
+          swift tools/smoke-macos.swift "$app" "$diagnostics" 2>&1 | tee "$diagnostics/smoke.log"
+      - name: Collect native macOS diagnostics
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p target/macos-smoke-diagnostics
+          ps -axo pid,ppid,state,command > target/macos-smoke-diagnostics/processes.txt
+          /usr/bin/log show --last 5m --style compact --predicate 'process == "tokenbubble" OR eventMessage CONTAINS "dev.cloudboy.tokenbubble"' > target/macos-smoke-diagnostics/unified.log 2>&1 || true
+          for report in "$HOME"/Library/Logs/DiagnosticReports/*tokenbubble* "$HOME"/Library/Logs/DiagnosticReports/*TokenBubble*; do
+            if [ -f "$report" ]; then cp "$report" target/macos-smoke-diagnostics/; fi
+          done
+      - name: Upload native diagnostics and screenshots
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostics-${{ matrix.platform }}
+          path: target/macos-smoke-diagnostics/
+          if-no-files-found: warn
+      - name: Upload release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.platform }}
+          path: target/release-packages/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish one combined release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+      - name: Combine checksums and publish immutable assets
+        shell: bash
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
+          test -f "tokenbubble-$RELEASE_TAG-windows-x86_64.zip"
+          test -f "tokenbubble-$RELEASE_TAG-macos-aarch64.zip"
+          test -f "tokenbubble-$RELEASE_TAG-macos-x86_64.zip"
+          sha256sum *.zip | sort -k2 > SHA256SUMS.txt
+          cat > release-notes.md <<'NOTES'
+          ## Downloads
+
+          - **Windows x64:** download the `windows-x86_64.zip`, extract to a permanent folder, and run **tokenbubble.exe**. Look for the bubbles icon beside the clock or under **Show Hidden Icons**.
+          - **macOS Apple Silicon (M1 or newer):** download `macos-aarch64.zip`.
+          - **macOS Intel:** download `macos-x86_64.zip`.
+
+          macOS requires **macOS 13 Ventura or newer**. Extract the ZIP, move **TokenBubble.app** to **Applications**, then open it. The bubbles menu-bar item opens the usage panel; right-click it for Refresh, Settings, About, and Quit. No ordinary window or Dock icon appears at launch. Use the Codex or Claude CLI's native macOS sign-in; credentials are never included in the download.
+
+          ## Signing and installation
+
+          **Windows is unsigned. macOS is ad-hoc signed, not Developer ID signed or notarized.** Windows SmartScreen or macOS Gatekeeper may block these downloads. Only proceed with a build you trust from this repository. On macOS, attempt to open the app, then use **System Settings → Privacy & Security → Open Anyway**. Do not disable Gatekeeper globally. Apple or administrator policies may prevent an override.
+
+          Verify your downloaded ZIP against **SHA256SUMS.txt** before opening it (`shasum -a 256 file.zip` on macOS, `Get-FileHash file.zip -Algorithm SHA256` in Windows PowerShell). Each ZIP contains **INSTALL.txt** and third-party notices.
+
+          Provider selection, usage/reset displays, background refresh, and saved settings use the existing panel. Windows users can enable **Start at sign-in** after installing the permanent copy; macOS start at sign-in is not supported. Updates are manual: quit TokenBubble, replace the installed app/executable, and reopen it. There is no app-managed login, credential refresh, installer, or automatic updater. Windows behavior is unchanged; WSL credential source selection is not included.
+          NOTES
+          options=(--repo "$GH_REPO" --verify-tag --title "TokenBubble $RELEASE_TAG" --notes-file release-notes.md)
+          if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease); fi
+          # gh release create fails if this release already exists; never replace published assets.
+          gh release create "$RELEASE_TAG" ./*.zip SHA256SUMS.txt "${options[@]}"

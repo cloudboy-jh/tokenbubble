@@ -10,27 +10,28 @@
 
 ## Current version (2026-10-29)
 
-- Standalone Windows tray app with a shared GPUI panel, settings, manual/background refresh, and selectable Codex/Claude providers. The selection is saved; switching clears the old provider's display, ignores outdated requests, and preserves separate rate-limit cooldowns.
-- The Windows tray icon is the installed Segoe UI Emoji bubbles glyph, rendered in native color at the taskbar's icon size. Usage remains in the panel and tooltip instead of changing the icon into bars. Windows may place it under Show Hidden Icons.
+- Standalone Windows tray and macOS menu-bar app with a shared GPUI panel, settings, manual/background refresh, and selectable Codex/Claude providers. The selection is saved; switching clears the old provider's display, ignores outdated requests, and preserves separate rate-limit cooldowns.
+- Windows renders its installed Segoe UI Emoji bubbles glyph at the taskbar icon size; macOS uses its native bubbles emoji in an AppKit status item. Usage remains in the panel and tooltip. Windows may place the icon under Show Hidden Icons.
 - Codex and Claude have embedded provider artwork in the panel header and selector, plus the settings source section. Claude uses its documented orange accent (`#D97757`); Codex keeps the existing accent and its blue/purple product artwork.
 - Run `cargo dev` from this repository in Windows PowerShell to build, launch, and rebuild on saved changes. Click the notification-area icon to open the panel; `q` then Enter stops the development runner. For a single launch, run `cargo run --locked -p tokenbubble-gpui --bin tokenbubble`.
 - Collection is read-only and uses the native CLI sign-in: Codex honors `CODEX_HOME` (default `~/.codex`); Claude honors `CLAUDE_CONFIG_DIR` (default `~/.claude`, `.credentials.json`). A Windows launch does not read WSL credentials. Neither collector refreshes tokens or changes CLI files.
 - One-shot commands: `cargo run --locked -p tokenbubble-core --bin tokenbubble-collect -- codex` or the same command ending in `claude`. Output contains usage or a classified error, never tokens.
 - Claude reports session, weekly, and supplied model/feature limits. Extra usage remains separate, with cents converted to major currency units. Missing identity or quota values are not invented.
 - Verified native Codex and Claude readings, notification icon publication, second-launch reveal, Escape dismissal without quitting, reopen, click-away, provider selection persistence, and explicit quit. Native screenshots also verified the bubbles emoji, both provider icons, orange Claude styling, and the settings source section. The expired-sign-in state was verified before the stored Claude login was renewed.
-- Native macOS Keychain behavior, multi-monitor/DPI changes, WSL source selection, and Compi integration remain unverified or unimplemented.
+- macOS uses a menu-bar-only app bundle, anchored usage flyout, native context menu, explicit quit, and LaunchServices reopen. Native account access, Keychain prompts, physical multi-monitor/DPI changes, WSL source selection, and Compi integration remain unverified or unimplemented.
 - Windows workspace tests and Clippy pass. The original planning sections below describe the intended broader product, not completed work.
 
-## Installing and releasing Windows
+## Installing and releasing
 
-- The Windows prerelease version is `0.1.0-beta.1`. Build its ZIP with `powershell -ExecutionPolicy Bypass -File tools/package-windows.ps1` from the repository root using native Windows Rust.
-- Packages are written under `target/release-packages/`: a versioned Windows x64 ZIP, `SHA256SUMS.txt`, and release notes. The ZIP contains only `tokenbubble.exe`, `INSTALL.txt`, and `THIRD_PARTY_NOTICES.md`; provider images are embedded in the executable.
-- Keep an installed copy outside the checkout, for example `%LOCALAPPDATA%\Programs\TokenBubble`. Launch that executable directly. Update by quitting the tray app, replacing the executable with a verified release, and relaunching. Settings remain in `%APPDATA%\TokenBubble\settings.toml`; CLI credentials remain owned by their CLIs.
-- Autostart remains opt-in. Enable it from the installed copy, or toggle it off/on there if an older development path was registered. Release builds have no development console and do not need Rust or `cargo dev` to run.
-- `.github/workflows/release-windows.yml` builds tags matching `v*` on Windows with Rust 1.99.0. It requires the tag to match the workspace version, checks formatting/tests/Clippy, runs the same packaging script, and publishes the ZIP and checksum. Tags containing `-` are published as prereleases.
-- To publish the next version, update `[workspace.package].version` and the workspace package entries in `Cargo.lock`, commit and push, then push the matching `v<version>` tag. Verify the workflow and download the release package before replacing an installed copy.
-- An existing unpublished tag can also be built explicitly with `gh workflow run release-windows.yml --ref main -f tag=v0.1.0-beta.1`. This leaves the tag unchanged and uses that tag's source.
-- These builds are unsigned; Windows may show a SmartScreen warning. No installer or automatic updater is included.
+- Version `0.1.0-beta.2` adds macOS Apple Silicon and Intel packages alongside Windows x64. macOS requires 13 Ventura or newer.
+- Build Windows with `powershell -ExecutionPolicy Bypass -File tools/package-windows.ps1`; build macOS with `bash tools/package-macos.sh` on the native architecture. ZIPs and local checksums are written under `target/release-packages/`.
+- Windows ZIPs contain `tokenbubble.exe`, `INSTALL.txt`, and `THIRD_PARTY_NOTICES.md`. macOS ZIPs contain `TokenBubble.app`, installation instructions, and notices. Provider artwork and Metal shaders are embedded; the Mac bundle includes an icon and is ad-hoc signed after assembly.
+- Keep Windows outside the checkout, for example `%LOCALAPPDATA%\Programs\TokenBubble`; move the Mac app to Applications. Quit from the native icon menu before replacing the executable or app bundle, then relaunch. Updates are manual.
+- Settings stay in `%APPDATA%\TokenBubble\settings.toml` on Windows, or `~/Library/Application Support/TokenBubble/settings.toml` on macOS. CLI credentials remain owned by their CLIs.
+- Windows autostart remains opt-in; enable it from the installed copy. The Mac app does not manage login items; users can add it in System Settings. Neither release needs Rust or `cargo dev`.
+- `.github/workflows/release.yml` builds native Windows x64, macOS Apple Silicon, and macOS Intel with Rust 1.99.0. Main-branch pushes build artifacts only. Tagged builds require the tag to match the workspace version and checked-out commit, then publish one release with all ZIPs and combined `SHA256SUMS.txt`. Tags containing `-` are prereleases.
+- To publish, update the workspace version and lockfile, commit and push, verify all native builds and Mac app interactions, then push the matching `v<version>` tag. An unpublished existing tag can be built with `gh workflow run release.yml --ref main -f tag=v<version>` without moving it.
+- Windows is unsigned. macOS is ad-hoc signed, not Developer ID signed or notarized; verify the checksum and use Privacy & Security's Open Anyway override only for trusted downloads. Managed Macs may prevent overrides. No installer or automatic updater is included.
 
 ## Inspection and limits
 

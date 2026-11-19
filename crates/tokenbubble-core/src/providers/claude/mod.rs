@@ -1,9 +1,14 @@
-//! Read-only Claude Code subscription usage via Anthropic OAuth.
+//! Claude Code subscription usage via Anthropic OAuth.
+//!
+//! An expired or early-revoked access token is renewed with Claude Code's refresh token
+//! and saved back to Claude Code's store (see [`refresh`]); nothing else is ever written,
+//! and the Claude CLI is never run.
 //!
 //! Request compatibility follows CodexBar ClaudeOAuthUsageFetcher at
 //! d554d44931807e568471c5ff0d7f786b9c33053b (MIT; see THIRD_PARTY_NOTICES.md).
 
 mod credentials;
+mod refresh;
 mod usage;
 
 use std::path::PathBuf;
@@ -11,8 +16,9 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 
 pub use credentials::{AUTH_FILE, ClaudeCredentials, load as load_credentials};
+pub use refresh::TOKEN_URL;
 
-use crate::model::{Account, ProviderId, UsageSnapshot};
+use crate::model::{Account, ProviderId, SnapshotOrigin, UsageSnapshot};
 use crate::providers::{AuthReason, CollectError};
 use crate::transport::{Request, Response, Transport};
 
@@ -61,16 +67,54 @@ pub fn usage_request(credentials: &ClaudeCredentials) -> Request {
     }
 }
 
-/// A read-only collection: no refresh, credential writes, or Claude CLI subprocesses.
+/// One reading. Credentials that lack the usage scope are never renewed; an expired token,
+/// or one the endpoint rejects although it looked fresh, is renewed at most once.
 pub fn collect(
     source: &ClaudeSource,
     transport: &dyn Transport,
     now: Timestamp,
 ) -> Result<UsageSnapshot, CollectError> {
-    let credentials = credentials::load(&source.claude_home)?;
-    credentials.ensure_usable(now)?;
-    let mut request = usage_request(&credentials);
-    let mut response = transport.get(&request)?;
+    let home = &source.claude_home;
+    let mut credentials = credentials::load(home)?;
+    let mut renewed = false;
+    match credentials.ensure_usable(now) {
+        Ok(()) => {}
+        Err(expired @ CollectError::AuthRequired { .. }) => {
+            credentials = refresh::renew(home, transport, &credentials, now, expired)?;
+            renewed = true;
+        }
+        Err(error) => return Err(error),
+    }
+    let mut response = fetch(transport, &credentials)?;
+    if response.status == 401 && !renewed {
+        let rejected = CollectError::AuthRequired {
+            reason: AuthReason::Rejected,
+        };
+        credentials = refresh::renew(home, transport, &credentials, now, rejected)?;
+        response = fetch(transport, &credentials)?;
+    }
+    let parsed = interpret(response)?;
+    Ok(UsageSnapshot {
+        provider: ProviderId::Claude,
+        measured_at: now,
+        origin: SnapshotOrigin::Live,
+        account: Account {
+            plan: credentials.subscription_type,
+            ..Account::default()
+        },
+        windows: parsed.windows,
+        credits: None,
+        spend_limit: parsed.spend_limit,
+        issues: parsed.issues,
+    })
+}
+
+fn fetch(
+    transport: &dyn Transport,
+    credentials: &ClaudeCredentials,
+) -> Result<Response, CollectError> {
+    let mut request = usage_request(credentials);
+    let response = transport.get(&request)?;
     // Exact inventory-compatibility retry from the primary reference: once for 400,
     // or 403 whose UTF-8 body does not mention the required scope. Same credential.
     if response.status == 400 || (response.status == 403 && !mentions_profile_scope(&response.body))
@@ -83,21 +127,9 @@ pub fn collect(
         {
             *value = COMPATIBILITY_USER_AGENT.to_owned();
         }
-        response = transport.get(&request)?;
+        return Ok(transport.get(&request)?);
     }
-    let parsed = interpret(response)?;
-    Ok(UsageSnapshot {
-        provider: ProviderId::Claude,
-        measured_at: now,
-        account: Account {
-            plan: credentials.subscription_type,
-            ..Account::default()
-        },
-        windows: parsed.windows,
-        credits: None,
-        spend_limit: parsed.spend_limit,
-        issues: parsed.issues,
-    })
+    Ok(response)
 }
 
 fn mentions_profile_scope(body: &[u8]) -> bool {

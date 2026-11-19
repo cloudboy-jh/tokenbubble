@@ -63,7 +63,113 @@ pub(super) fn parse(body: &[u8]) -> Result<ParsedUsage, CollectError> {
         Some(_) => issues.push("additional_rate_limits".to_owned()),
     }
 
-    let credits = object_field(&root, "credits", "credits", &mut issues).map(|credits| Credits {
+    let credits = object_field(&root, "credits", "credits", &mut issues).map(credits);
+    let plan = plan_type(&root);
+
+    Ok(ParsedUsage {
+        plan,
+        windows,
+        credits,
+        spend_limit: resolve_spend_limit(&root, rate_limit),
+        issues,
+    })
+}
+
+/// The `rate_limits` object Codex CLI logged with a `token_count` event at `logged_at`,
+/// normalized like the live response so window ids match. A window whose reset time has passed
+/// by `now` is reported as reset: 0% used, next reset whole durations later. `None` when the
+/// object holds no window.
+pub(super) fn parse_logged(
+    rate_limits: &Map<String, Value>,
+    logged_at: Timestamp,
+    now: Timestamp,
+) -> Option<ParsedUsage> {
+    let mut issues = Vec::new();
+    let mut ids = HashSet::new();
+    let mut windows: Vec<QuotaWindow> = ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|slot| logged_window(rate_limits, slot, logged_at, &mut issues))
+        .map(|raw| normalize_window(roll_forward(raw, now), None, "", &mut ids))
+        .collect();
+    if windows.is_empty() {
+        return None;
+    }
+    windows.sort_by_key(|window| window.kind);
+    let credits =
+        object_field(rate_limits, "credits", "rate_limits.credits", &mut issues).map(credits);
+    Some(ParsedUsage {
+        plan: plan_type(rate_limits),
+        windows,
+        credits,
+        spend_limit: resolve_spend_limit(rate_limits, None),
+        issues,
+    })
+}
+
+/// `{used_percent, window_minutes, resets_at}`. CLI versions before `resets_at` logged
+/// `resets_in_seconds`, relative to the line. `None` when absent, null, or malformed; malformed
+/// windows are recorded as issues.
+fn logged_window(
+    map: &Map<String, Value>,
+    key: &str,
+    logged_at: Timestamp,
+    issues: &mut Vec<String>,
+) -> Option<RawWindow> {
+    let value = match map.get(key) {
+        None | Some(Value::Null) => return None,
+        Some(value) => value,
+    };
+    let raw = value.as_object().and_then(|window| {
+        let present = |key: &str| window.get(key).filter(|value| !value.is_null());
+        let duration_secs = match present("window_minutes") {
+            Some(minutes) => strict_integer(minutes)?.checked_mul(60)?,
+            None => 0,
+        };
+        let reset_at = match (present("resets_at"), present("resets_in_seconds")) {
+            (Some(at), _) => strict_integer(at)?,
+            (None, Some(seconds)) => logged_at
+                .as_second()
+                .checked_add(lenient_integer(seconds)?)?,
+            (None, None) => 0,
+        };
+        Some(RawWindow {
+            used_percent: window
+                .get("used_percent")?
+                .as_f64()
+                .filter(|v| v.is_finite())?,
+            reset_at,
+            duration_secs,
+        })
+    });
+    if raw.is_none() {
+        issues.push(format!("rate_limits.{key}"));
+    }
+    raw
+}
+
+/// A logged window whose reset time is not after `now` has reset since it was logged.
+fn roll_forward(raw: RawWindow, now: Timestamp) -> RawWindow {
+    let now = now.as_second();
+    if raw.reset_at <= 0 || raw.reset_at > now {
+        return raw;
+    }
+    let next_reset = (raw.duration_secs > 0)
+        .then(|| {
+            let periods = (now - raw.reset_at) / raw.duration_secs + 1;
+            periods
+                .checked_mul(raw.duration_secs)
+                .and_then(|elapsed| raw.reset_at.checked_add(elapsed))
+        })
+        .flatten();
+    RawWindow {
+        used_percent: 0.0,
+        reset_at: next_reset.unwrap_or(0),
+        duration_secs: raw.duration_secs,
+    }
+}
+
+fn credits(credits: &Map<String, Value>) -> Credits {
+    Credits {
         has_credits: credits
             .get("has_credits")
             .and_then(Value::as_bool)
@@ -73,22 +179,15 @@ pub(super) fn parse(body: &[u8]) -> Result<ParsedUsage, CollectError> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         balance: credits.get("balance").and_then(lenient_number),
-    });
+    }
+}
 
-    let plan = root
-        .get("plan_type")
+fn plan_type(map: &Map<String, Value>) -> Option<String> {
+    map.get("plan_type")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|plan| !plan.is_empty())
-        .map(str::to_owned);
-
-    Ok(ParsedUsage {
-        plan,
-        windows,
-        credits,
-        spend_limit: resolve_spend_limit(&root, rate_limit),
-        issues,
-    })
+        .map(str::to_owned)
 }
 
 fn additional_windows(

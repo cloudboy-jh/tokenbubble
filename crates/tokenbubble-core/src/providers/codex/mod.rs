@@ -1,9 +1,11 @@
-//! Codex subscription usage via the ChatGPT backend, authenticated with Codex CLI's sign-in.
+//! Codex subscription usage via the ChatGPT backend, authenticated with Codex CLI's sign-in,
+//! with the rate limits Codex CLI last logged as a fallback when that sign-in cannot be used.
 //!
 //! Request construction and URL resolution are adapted from CodexBar
 //! `CodexOAuthUsageFetcher.swift` (MIT; see THIRD_PARTY_NOTICES.md).
 
 mod credentials;
+mod logs;
 mod usage;
 
 use std::fs::File;
@@ -14,7 +16,7 @@ use jiff::Timestamp;
 
 pub use credentials::{AUTH_FILE, CodexCredentials, load as load_credentials};
 
-use crate::model::{Account, ProviderId, UsageSnapshot};
+use crate::model::{Account, ProviderId, SnapshotOrigin, UsageSnapshot};
 use crate::providers::{AuthReason, CollectError};
 use crate::transport::{Request, Response, Transport};
 
@@ -107,19 +109,56 @@ pub fn usage_request(credentials: &CodexCredentials, url: String) -> Request {
     }
 }
 
-/// One read-only collection. Never refreshes tokens or writes Codex files.
+/// One collection. Never refreshes tokens or writes Codex files.
+///
+/// When Codex CLI's stored sign-in is expired or rejected, the snapshot comes from the rate
+/// limits Codex CLI last wrote to its session logs ([`SnapshotOrigin::LocalLog`], measured when
+/// they were logged); without such a log the sign-in error is returned. Other failures never
+/// fall back, so a transient one keeps the previous live reading.
 pub fn collect(
     source: &CodexSource,
     transport: &dyn Transport,
     now: Timestamp,
 ) -> Result<UsageSnapshot, CollectError> {
     let credentials = credentials::load(&source.codex_home)?;
+    match collect_live(source, &credentials, transport, now) {
+        Ok(parsed) => Ok(snapshot(credentials, parsed, now, SnapshotOrigin::Live)),
+        Err(error @ CollectError::AuthRequired { .. }) => logs::latest(&source.codex_home, now)
+            .map(|logged| {
+                snapshot(
+                    credentials,
+                    logged.usage,
+                    logged.logged_at,
+                    SnapshotOrigin::LocalLog,
+                )
+            })
+            .ok_or(error),
+        Err(error) => Err(error),
+    }
+}
+
+fn collect_live(
+    source: &CodexSource,
+    credentials: &CodexCredentials,
+    transport: &dyn Transport,
+    now: Timestamp,
+) -> Result<usage::ParsedUsage, CollectError> {
     credentials.ensure_fresh(now)?;
-    let request = usage_request(&credentials, source.usage_url()?);
-    let parsed = interpret(transport.get(&request)?)?;
-    Ok(UsageSnapshot {
+    let request = usage_request(credentials, source.usage_url()?);
+    interpret(transport.get(&request)?)
+}
+
+/// The reported plan wins over the ID token's claim.
+fn snapshot(
+    credentials: CodexCredentials,
+    parsed: usage::ParsedUsage,
+    measured_at: Timestamp,
+    origin: SnapshotOrigin,
+) -> UsageSnapshot {
+    UsageSnapshot {
         provider: ProviderId::Codex,
-        measured_at: now,
+        measured_at,
+        origin,
         account: Account {
             id: credentials.account_id,
             email: credentials.email,
@@ -129,7 +168,7 @@ pub fn collect(
         credits: parsed.credits,
         spend_limit: parsed.spend_limit,
         issues: parsed.issues,
-    })
+    }
 }
 
 fn interpret(response: Response) -> Result<usage::ParsedUsage, CollectError> {

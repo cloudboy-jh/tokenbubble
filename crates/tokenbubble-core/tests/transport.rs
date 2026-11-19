@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
@@ -7,7 +7,8 @@ use std::time::Duration;
 use tokenbubble_core::secret::Secret;
 use tokenbubble_core::transport::{HttpTransport, Limits, Request, Transport, TransportError};
 
-/// Serves one raw HTTP response and reports the received request head.
+/// Serves one raw HTTP response and reports the received request head, then a blank line
+/// and any `Content-Length` body.
 fn serve_once(response: Vec<u8>, delay: Duration) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/usage", listener.local_addr().unwrap());
@@ -16,13 +17,23 @@ fn serve_once(response: Vec<u8>, delay: Duration) -> (String, mpsc::Receiver<Str
         let (mut stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut head = String::new();
+        let mut length = 0;
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
                 break;
             }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
             head.push_str(&line);
         }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        head.push_str("\r\n");
+        head.push_str(&String::from_utf8(body).unwrap());
         sender.send(head).unwrap();
         thread::sleep(delay);
         let _ = stream.write_all(&response);
@@ -80,6 +91,54 @@ fn refuses_redirects() {
         .get(&request(url))
         .unwrap_err();
     assert_eq!(error, TransportError::Redirect { status: 302 });
+}
+
+#[test]
+fn posts_json_body_with_headers_and_shared_limits() {
+    let (url, received) = serve_once(
+        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec(),
+        Duration::ZERO,
+    );
+    let body = Secret::new(r#"{"grant_type":"refresh_token"}"#);
+    let post = Request {
+        url,
+        bearer: None,
+        headers: vec![("anthropic-beta", "oauth-2025-04-20".to_owned())],
+    };
+    let response = HttpTransport::new(limits(5_000, 1024))
+        .post_json(&post, &body)
+        .unwrap();
+    assert_eq!(response.status, 400);
+    assert_eq!(response.body, b"{}");
+    let received = received.recv().unwrap();
+    let lower = received.to_ascii_lowercase();
+    assert!(lower.starts_with("post /usage http/1.1\r\n"), "{received}");
+    assert!(
+        lower.contains("content-type: application/json"),
+        "{received}"
+    );
+    assert!(
+        lower.contains("anthropic-beta: oauth-2025-04-20"),
+        "{received}"
+    );
+    assert!(!lower.contains("authorization"), "{received}");
+    assert!(!lower.contains("cookie"), "{received}");
+    assert!(
+        received.ends_with(r#"{"grant_type":"refresh_token"}"#),
+        "{received}"
+    );
+
+    let (url, _received) = serve_once(
+        b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://elsewhere.example/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_vec(),
+        Duration::ZERO,
+    );
+    let redirect = Request { url, ..post };
+    let error = HttpTransport::new(limits(5_000, 1024))
+        .post_json(&redirect, &body)
+        .unwrap_err();
+    assert_eq!(error, TransportError::Redirect { status: 307 });
+    assert!(!format!("{error:?} {error} {redirect:?} {body:?}").contains("refresh_token"));
 }
 
 #[test]

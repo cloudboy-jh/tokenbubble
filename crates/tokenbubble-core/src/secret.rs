@@ -11,7 +11,8 @@ impl Secret {
         Self(value.into())
     }
 
-    /// Borrow the raw value for the single place that needs it: the outgoing request header.
+    /// Borrow the raw value only to send it (request headers and token bodies) or to save a
+    /// renewed sign-in back to its owner's store.
     pub fn expose(&self) -> &str {
         &self.0
     }

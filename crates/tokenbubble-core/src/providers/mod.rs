@@ -16,10 +16,16 @@ pub enum CollectError {
     CredentialsUnreadable {
         path: PathBuf,
     },
+    /// A renewed sign-in could not be saved back to the owning CLI's store. The refresh
+    /// token it replaced is already spent, so the CLI must sign in again.
+    CredentialsUnwritable {
+        path: PathBuf,
+    },
     CredentialsMalformed {
         detail: &'static str,
     },
-    /// The owning CLI must sign in or refresh; TokenBubble never redeems refresh tokens.
+    /// The stored sign-in is unusable and only the owning CLI can fix it. TokenBubble renews
+    /// only Claude sign-ins, with the refresh token Claude Code stored.
     AuthRequired {
         reason: AuthReason,
     },
@@ -56,6 +62,7 @@ impl CollectError {
         match self {
             Self::CredentialsMissing { .. } => "credentials_missing",
             Self::CredentialsUnreadable { .. } => "credentials_unreadable",
+            Self::CredentialsUnwritable { .. } => "credentials_unwritable",
             Self::CredentialsMalformed { .. } => "credentials_malformed",
             Self::AuthRequired { .. } => "auth_required",
             Self::Unsupported { .. } => "unsupported",
@@ -95,6 +102,13 @@ impl fmt::Display for CollectError {
                 write!(
                     f,
                     "{} could not be read; check its permissions",
+                    path.display()
+                )
+            }
+            Self::CredentialsUnwritable { path } => {
+                write!(
+                    f,
+                    "the renewed sign-in could not be saved to {}; check its permissions, then sign in again with the provider's CLI",
                     path.display()
                 )
             }

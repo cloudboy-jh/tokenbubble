@@ -12,7 +12,8 @@ use macos as native_tray;
 #[cfg(windows)]
 use windows as native_tray;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -21,8 +22,10 @@ use gpui::{
     size,
 };
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
+use tokenbubble_core::activity::ActivityScanner;
 use tokenbubble_core::config::Settings;
-use tokenbubble_core::model::{ProviderId, UsageSnapshot};
+use tokenbubble_core::model::{Activity, ProviderId, UsageSnapshot};
 use tokenbubble_core::providers::CollectError;
 use tokenbubble_core::providers::claude::{self, ClaudeSource};
 use tokenbubble_core::providers::codex::{self, CodexSource};
@@ -281,6 +284,8 @@ struct Host {
     #[cfg(any(windows, target_os = "macos"))]
     tray: Option<TrayState>,
     _subscriptions: Vec<Subscription>,
+    /// Shared with background collections; caches per-file log totals between scans.
+    scanner: Arc<Mutex<ActivityScanner>>,
     _ticker: Task<()>,
 }
 
@@ -327,6 +332,7 @@ impl Host {
             #[cfg(any(windows, target_os = "macos"))]
             tray: None,
             _subscriptions: subscriptions,
+            scanner: Arc::new(Mutex::new(ActivityScanner::new())),
             _ticker: ticker,
         };
         // The first reading is wanted even in manual mode.
@@ -352,12 +358,15 @@ impl Host {
             return;
         };
         self.panel.update(cx, |panel, cx| panel.begin_refresh(cx));
+        let scanner = self.scanner.clone();
         cx.spawn(async move |host, cx| {
-            let result = cx
+            let (result, activity) = cx
                 .background_executor()
-                .spawn(async move { collect(request.provider) })
+                .spawn(async move { collect(request.provider, &scanner) })
                 .await;
-            let _ = host.update(cx, |host, cx| host.finish_refresh(request, result, cx));
+            let _ = host.update(cx, |host, cx| {
+                host.finish_refresh(request, result, activity, cx)
+            });
         })
         .detach();
     }
@@ -366,10 +375,14 @@ impl Host {
         &mut self,
         request: CollectionRequest,
         result: Result<UsageSnapshot, CollectError>,
+        activity: Option<Activity>,
         cx: &mut Context<Self>,
     ) {
         if self.collections.finish(request, &result, Instant::now()) {
-            self.panel.update(cx, |panel, cx| panel.apply(result, cx));
+            self.panel.update(cx, |panel, cx| {
+                panel.apply(result, cx);
+                panel.set_activity(request.provider, activity, cx);
+            });
         } else if request.provider == self.settings.provider {
             // A → B → A coalesces with the old A request, then fetches a fresh reading.
             self.refresh(cx);
@@ -720,13 +733,37 @@ fn start_at_login() -> Option<bool> {
     None
 }
 
-/// Blocking; runs on the background executor.
-fn collect(provider: ProviderId) -> Result<UsageSnapshot, CollectError> {
+/// Blocking; runs on the background executor. Activity comes from local logs and is
+/// reported even when the usage reading fails.
+fn collect(
+    provider: ProviderId,
+    scanner: &Mutex<ActivityScanner>,
+) -> (Result<UsageSnapshot, CollectError>, Option<Activity>) {
     let transport = HttpTransport::default();
     let now = Timestamp::now();
+    let scan = |home: &Path| {
+        scanner.lock().unwrap_or_else(PoisonError::into_inner).scan(
+            provider,
+            home,
+            now,
+            &TimeZone::system(),
+        )
+    };
     match provider {
-        ProviderId::Codex => codex::collect(&CodexSource::from_env()?, &transport, now),
-        ProviderId::Claude => claude::collect(&ClaudeSource::from_env()?, &transport, now),
+        ProviderId::Codex => match CodexSource::from_env() {
+            Ok(source) => (
+                codex::collect(&source, &transport, now),
+                scan(&source.codex_home),
+            ),
+            Err(error) => (Err(error), None),
+        },
+        ProviderId::Claude => match ClaudeSource::from_env() {
+            Ok(source) => (
+                claude::collect(&source, &transport, now),
+                scan(&source.claude_home),
+            ),
+            Err(error) => (Err(error), None),
+        },
     }
 }
 

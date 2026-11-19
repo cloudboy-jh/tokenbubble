@@ -4,13 +4,14 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use tokenbubble_core::config::{BarFill, ResetDisplay};
 use tokenbubble_core::model::{
-    Account, Credits, ProviderId, QuotaWindow, SpendLimit, UsageSnapshot, WindowKind,
+    Account, Activity, Credits, DayActivity, NamedTokens, ProviderId, QuotaWindow, SnapshotOrigin,
+    SpendLimit, TokenCounts, UsageSnapshot, WindowKind,
 };
 use tokenbubble_core::providers::{AuthReason, CollectError};
 use tokenbubble_core::transport::TransportError;
 use tokenbubble_gpui::presentation::{
-    BarView, Body, DisplayOptions, MoneyRow, PanelState, Tone, plan_name, present, reset_text,
-    tray_tooltip,
+    BarView, Body, DisplayOptions, MoneyRow, PanelState, ShareRow, Tone, plan_name, present,
+    reset_text, tokens, tray_tooltip,
 };
 
 /// 2026-10-13T04:00:00Z, a Tuesday.
@@ -45,6 +46,7 @@ fn snapshot(windows: Vec<QuotaWindow>) -> UsageSnapshot {
     UsageSnapshot {
         provider: ProviderId::Codex,
         measured_at: "2026-10-13T03:58:00Z".parse().unwrap(),
+        origin: SnapshotOrigin::Live,
         account: Account {
             id: Some("acct".into()),
             email: Some("user@example.com".into()),
@@ -374,4 +376,116 @@ fn spend_currency_is_explicit_and_credits_remain_unitless() {
         assert_eq!(money[0].value, "12.50");
         assert_eq!(money[1].value, expected);
     }
+}
+
+#[test]
+fn pace_projects_from_the_measurement_and_warns_only_when_the_limit_is_ahead() {
+    // Measured 03:58; a weekly window that resets in 5 days has run for 2 days.
+    let reset: Timestamp = "2026-10-18T03:58:00Z".parse().unwrap();
+    let paced = |used: f64| {
+        let mut window = weekly(used);
+        window.resets_at = Some(reset);
+        bars(&ready(snapshot(vec![window])), defaults())[0]
+            .pace
+            .clone()
+    };
+    assert_eq!(
+        paced(20.0),
+        Some(("On pace for about 70% by reset".into(), Tone::Muted))
+    );
+    // 40% in 2 days reaches 100% 3 days after the measurement.
+    assert_eq!(
+        paced(40.0),
+        Some((
+            "At this pace you'll hit the limit Fri Oct 16 3:58 AM".into(),
+            Tone::Warning
+        ))
+    );
+    assert_eq!(paced(0.0), None, "nothing used yet says nothing about pace");
+    assert_eq!(paced(100.0), None, "already at the limit");
+
+    let mut fresh = weekly(5.0);
+    fresh.resets_at = Some("2026-10-20T03:30:00Z".parse().unwrap());
+    assert_eq!(
+        bars(&ready(snapshot(vec![fresh])), defaults())[0].pace,
+        None,
+        "under an hour into the window"
+    );
+}
+
+#[test]
+fn log_readings_say_where_they_came_from() {
+    let mut reading = snapshot(vec![weekly(1.0)]);
+    reading.origin = SnapshotOrigin::LocalLog;
+    let state = ready(reading);
+    assert_eq!(
+        present(&state, now(), &utc(), defaults()).status,
+        Some(("From Codex's local log · 2m ago".into(), Tone::Muted))
+    );
+    assert!(tray_tooltip(&state, now(), defaults()).ends_with("From local log 2m ago"));
+}
+
+#[test]
+fn activity_totals_exclude_cache_reads_and_shares_use_the_week() {
+    let counts = |input, cache_read, output| TokenCounts {
+        input,
+        cache_read,
+        cache_write: 0,
+        output,
+    };
+    let start: jiff::civil::Date = "2026-10-07".parse().unwrap();
+    let days = (0..7)
+        .map(|offset| DayActivity {
+            date: start.checked_add(jiff::Span::new().days(offset)).unwrap(),
+            tokens: match offset {
+                4 => counts(3_000_000, 50_000_000, 1_000_000),
+                6 => counts(900_000, 0, 100_000),
+                _ => TokenCounts::default(),
+            },
+        })
+        .collect();
+    let mut state = ready(snapshot(vec![weekly(1.0)]));
+    state.set_activity(
+        ProviderId::Codex,
+        Some(Activity {
+            days,
+            models: vec![
+                NamedTokens {
+                    name: "gpt-6.1-sol".into(),
+                    tokens: counts(3_500_000, 0, 1_000_000),
+                },
+                NamedTokens {
+                    name: "idle".into(),
+                    tokens: TokenCounts::default(),
+                },
+            ],
+            projects: Vec::new(),
+            last_hour: TokenCounts::default(),
+        }),
+    );
+    let activity = present(&state, now(), &utc(), defaults()).activity.unwrap();
+    assert_eq!(activity.summary, "1.0M today · 5.0M this week");
+    assert_eq!(
+        activity.note.as_deref(),
+        Some("50M cache reads not counted")
+    );
+    assert_eq!(activity.days.len(), 7);
+    assert_eq!(activity.days[4].fill, 1.0);
+    assert!(activity.days[6].today);
+    assert_eq!(activity.days[6].label, "Tue");
+    assert_eq!(
+        activity.models,
+        [ShareRow {
+            name: "gpt-6.1-sol".into(),
+            value: "4.5M · 90%".into()
+        }]
+    );
+
+    state.set_activity(ProviderId::Claude, None);
+    assert!(
+        state.activity.is_some(),
+        "another provider's scan is ignored"
+    );
+    assert_eq!(tokens(999), "999");
+    assert_eq!(tokens(12_345), "12K");
 }

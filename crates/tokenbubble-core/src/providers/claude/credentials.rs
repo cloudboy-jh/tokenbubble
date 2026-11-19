@@ -1,17 +1,23 @@
-//! Read-only Claude Code OAuth credentials. Refresh tokens are deliberately not decoded.
+//! Claude Code OAuth credentials and the store Claude Code keeps them in.
+//!
+//! Both tokens are held only as [`Secret`]s. The store is written solely to save a sign-in
+//! TokenBubble renewed on Claude Code's behalf; every other key is written back as read.
 //!
 //! Adapted from CodexBar's ClaudeOAuthCredentialModels and SecurityCLIReader (MIT;
 //! see THIRD_PARTY_NOTICES.md).
 
 use std::fmt;
-use std::fs::File;
-use std::io::{ErrorKind, Read};
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jiff::Timestamp;
 use serde::Deserialize;
 use serde::de::IgnoredAny;
+use serde_json::{Value, json};
 
+use super::refresh::Renewal;
 use crate::providers::{AuthReason, CollectError};
 use crate::secret::Secret;
 
@@ -21,6 +27,8 @@ const MAX_AUTH_BYTES: u64 = 1024 * 1024;
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClaudeCredentials {
     pub access_token: Secret,
+    /// Present when Claude Code stored one; redeemed only by [`super::refresh`].
+    pub refresh_token: Option<Secret>,
     pub expires_at: Option<Timestamp>,
     pub scopes: Vec<String>,
     pub subscription_type: Option<String>,
@@ -48,6 +56,7 @@ struct Root {
 #[serde(rename_all = "camelCase")]
 struct OAuth {
     access_token: Option<String>,
+    refresh_token: Option<String>,
     expires_at: Option<f64>,
     #[serde(default)]
     scopes: Vec<String>,
@@ -72,12 +81,8 @@ impl ClaudeCredentials {
                 }
             });
         };
-        let access_token = oauth
-            .access_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .ok_or(CollectError::CredentialsMalformed {
+        let access_token =
+            nonempty(oauth.access_token).ok_or(CollectError::CredentialsMalformed {
                 detail: "Claude OAuth access token is missing",
             })?;
         // Claude stores epoch milliseconds, not JWT seconds. Missing or invalid expiry is
@@ -92,6 +97,7 @@ impl ClaudeCredentials {
         });
         Ok(Self {
             access_token: Secret::new(access_token),
+            refresh_token: nonempty(oauth.refresh_token).map(Secret::new),
             expires_at,
             scopes: oauth.scopes,
             subscription_type: nonempty(oauth.subscription_type),
@@ -99,6 +105,7 @@ impl ClaudeCredentials {
         })
     }
 
+    /// Scope is checked before expiry: credentials that cannot report usage are never renewed.
     pub fn ensure_usable(&self, now: Timestamp) -> Result<(), CollectError> {
         if !self.scopes.iter().any(|scope| scope == "user:profile") {
             return Err(CollectError::Unsupported {
@@ -121,17 +128,145 @@ fn nonempty(value: Option<String>) -> Option<String> {
 }
 
 pub fn load(claude_home: &Path) -> Result<ClaudeCredentials, CollectError> {
-    let path = claude_home.join(AUTH_FILE);
-    let result = read_bounded(&path).and_then(|bytes| ClaudeCredentials::parse(&bytes));
+    Document::read(claude_home)?.credentials()
+}
+
+/// Where Claude Code keeps the credentials TokenBubble read.
+enum Store {
+    File(PathBuf),
+    /// The macOS Keychain item. The path is only named in errors.
     #[cfg(target_os = "macos")]
-    if matches!(result, Err(CollectError::CredentialsMissing { .. }))
-        && std::env::home_dir().is_some_and(|home| claude_home == home.join(".claude"))
-    {
-        // The shared Keychain item belongs only to the default CLI profile.
-        // An explicitly selected directory must never fall back to another account.
-        return keychain::load(&path);
+    Keychain(PathBuf),
+}
+
+/// The raw stored credential document. It holds both tokens, so it has no `Debug`.
+pub(super) struct Document {
+    store: Store,
+    bytes: Vec<u8>,
+}
+
+impl Document {
+    pub(super) fn read(claude_home: &Path) -> Result<Self, CollectError> {
+        let path = claude_home.join(AUTH_FILE);
+        let result = read_bounded(&path);
+        #[cfg(target_os = "macos")]
+        if matches!(result, Err(CollectError::CredentialsMissing { .. }))
+            && std::env::home_dir().is_some_and(|home| claude_home == home.join(".claude"))
+        {
+            // The shared Keychain item belongs only to the default CLI profile.
+            // An explicitly selected directory must never fall back to another account.
+            return Ok(Self {
+                bytes: keychain::load(&path)?,
+                store: Store::Keychain(path),
+            });
+        }
+        Ok(Self {
+            bytes: result?,
+            store: Store::File(path),
+        })
+    }
+
+    pub(super) fn credentials(&self) -> Result<ClaudeCredentials, CollectError> {
+        ClaudeCredentials::parse(&self.bytes)
+    }
+
+    /// Stores `renewal` where this document came from and returns the stored credentials.
+    /// Only `accessToken`, `refreshToken` (when the server rotated it), `expiresAt`, and
+    /// `scopes` (when the server reported them) change; every other key keeps its value
+    /// and position. A failed write is retried once.
+    pub(super) fn save(
+        &self,
+        renewal: &Renewal,
+        now: Timestamp,
+    ) -> Result<ClaudeCredentials, CollectError> {
+        let bytes = renewed(&self.bytes, renewal, now)?;
+        let credentials = ClaudeCredentials::parse(&bytes)?;
+        self.store
+            .write(&bytes)
+            .or_else(|_| self.store.write(&bytes))?;
+        Ok(credentials)
+    }
+}
+
+fn renewed(bytes: &[u8], renewal: &Renewal, now: Timestamp) -> Result<Vec<u8>, CollectError> {
+    let malformed = || CollectError::CredentialsMalformed {
+        detail: "claudeAiOauth is missing",
+    };
+    let mut root: Value = serde_json::from_slice(bytes).map_err(|_| malformed())?;
+    let oauth = root
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(malformed)?;
+    oauth.insert(
+        "accessToken".to_owned(),
+        json!(renewal.access_token.expose()),
+    );
+    if let Some(refresh_token) = &renewal.refresh_token {
+        oauth.insert("refreshToken".to_owned(), json!(refresh_token.expose()));
+    }
+    // Without a reported lifetime the token is stored as already expired, so the next
+    // reading renews it again with the refresh token saved here.
+    let lifetime_ms = renewal.expires_in.map_or(0, |seconds| {
+        i64::try_from(seconds)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000)
+    });
+    oauth.insert(
+        "expiresAt".to_owned(),
+        json!(now.as_millisecond().saturating_add(lifetime_ms)),
+    );
+    if let Some(scopes) = &renewal.scopes {
+        oauth.insert("scopes".to_owned(), json!(scopes));
+    }
+    serde_json::to_vec(&root).map_err(|_| malformed())
+}
+
+impl Store {
+    fn write(&self, bytes: &[u8]) -> Result<(), CollectError> {
+        match self {
+            Self::File(path) => {
+                write_atomically(path, bytes).map_err(|_| CollectError::CredentialsUnwritable {
+                    path: path.to_owned(),
+                })
+            }
+            #[cfg(target_os = "macos")]
+            Self::Keychain(path) => keychain::save(path, bytes),
+        }
+    }
+}
+
+/// Replaces the file through a same-directory temp file and a rename, so Claude Code never
+/// sees a partial document. A symlinked store is written through to its target. The temp
+/// file is owner-only and never outlives a failed write.
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let target = std::fs::canonicalize(path)?;
+    let (Some(directory), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(ErrorKind::InvalidInput.into());
+    };
+    let mut temp_name = name.to_owned();
+    temp_name.push(format!(
+        ".tokenbubble-{}-{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = directory.join(temp_name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(&temp)?;
+    let result = write_and_close(file, bytes).and_then(|()| std::fs::rename(&temp, &target));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Flushes to disk and closes, since Windows cannot rename a file that is still open.
+fn write_and_close(mut file: File, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>, CollectError> {
@@ -163,25 +298,116 @@ mod keychain {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    pub(super) fn load(path: &Path) -> Result<ClaudeCredentials, CollectError> {
+    /// Exact Claude Code generic-password service from the primary reference.
+    const SERVICE: &str = "Claude Code-credentials";
+    const SECURITY: &str = "/usr/bin/security";
+    /// Conservative bound for one `security -i` command line.
+    const MAX_INTERACTIVE_LINE: usize = 4000;
+
+    pub(super) fn load(path: &Path) -> Result<Vec<u8>, CollectError> {
         let unreadable = || CollectError::CredentialsUnreadable {
             path: path.to_owned(),
         };
-        // Exact Claude Code generic-password service from the primary reference. No shell,
-        // CLI invocation, Keychain writes, stderr capture, or credential-bearing diagnostics.
-        let mut child = Command::new("/usr/bin/security")
-            .args([
-                "find-generic-password",
-                "-s",
-                "Claude Code-credentials",
-                "-w",
-            ])
-            .stdin(Stdio::null())
+        // No shell, Claude CLI invocation, stderr capture, or credential-bearing diagnostics.
+        let bytes = run(
+            &["find-generic-password", "-s", SERVICE, "-w"],
+            None,
+            Duration::from_millis(1500),
+        )
+        .ok_or_else(unreadable)?;
+        if bytes.len() as u64 > MAX_AUTH_BYTES {
+            return Err(CollectError::CredentialsMalformed {
+                detail: "Claude Keychain credential is unexpectedly large",
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Updates the existing item in place (`-U`) under its own account so Claude Code's
+    /// account-less lookup still finds exactly one item. Success is judged by reading the
+    /// item back, not by `security`'s exit status, which `-i` does not tie to its commands.
+    pub(super) fn save(path: &Path, bytes: &[u8]) -> Result<(), CollectError> {
+        let unwritable = || CollectError::CredentialsUnwritable {
+            path: path.to_owned(),
+        };
+        let account = account().ok_or_else(unwritable)?;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let expected = ClaudeCredentials::parse(bytes)?;
+        let stored = || {
+            load(path)
+                .ok()
+                .and_then(|bytes| ClaudeCredentials::parse(&bytes).ok())
+                .is_some_and(|stored| stored == expected)
+        };
+        let deadline = Duration::from_secs(5);
+        // `security -i` reads the command from stdin, keeping the credential out of the
+        // process list. Its line buffer is bounded and the account is quoted, so oversized
+        // documents, accounts with quoting characters, or a rejected interactive command
+        // fall back to argv. That fallback exposes the hex-encoded credential to other
+        // local users' `ps` while `security` runs; `security` has no other non-prompting
+        // way to take the secret.
+        let line = format!("add-generic-password -U -a \"{account}\" -s \"{SERVICE}\" -X {hex}\n");
+        if !account.contains(['"', '\\', '\n', '\r'])
+            && line.len() <= MAX_INTERACTIVE_LINE
+            && run(&["-i"], Some(line.into_bytes()), deadline).is_some()
+            && stored()
+        {
+            return Ok(());
+        }
+        let args = [
+            "add-generic-password",
+            "-U",
+            "-a",
+            account.as_str(),
+            "-s",
+            SERVICE,
+            "-X",
+            hex.as_str(),
+        ];
+        if run(&args, None, deadline).is_some() && stored() {
+            return Ok(());
+        }
+        Err(unwritable())
+    }
+
+    /// The existing item's account, read from its attributes (never its secret); Claude
+    /// Code itself files the item under the login user name.
+    fn account() -> Option<String> {
+        let attributes = run(
+            &["find-generic-password", "-s", SERVICE],
+            None,
+            Duration::from_millis(1500),
+        )?;
+        String::from_utf8_lossy(&attributes)
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("\"acct\"<blob>=\"")?
+                    .strip_suffix('"')
+                    .map(str::to_owned)
+            })
+            .or_else(|| std::env::var("USER").ok())
+            .filter(|account| !account.is_empty())
+    }
+
+    /// Runs `security` with a deadline, returning bounded stdout on success.
+    fn run(args: &[&str], stdin: Option<Vec<u8>>, deadline: Duration) -> Option<Vec<u8>> {
+        let mut child = Command::new(SECURITY)
+            .args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|_| unreadable())?;
-        let stdout = child.stdout.take().ok_or_else(unreadable)?;
+            .ok()?;
+        let writer = child.stdin.take().zip(stdin).map(|(mut pipe, input)| {
+            // Dropping the pipe at the end sends EOF, ending `security -i`.
+            std::thread::spawn(move || pipe.write_all(&input))
+        });
+        let stdout = child.stdout.take()?;
         let reader = std::thread::spawn(move || {
             let mut bytes = Vec::new();
             stdout
@@ -189,33 +415,20 @@ mod keychain {
                 .read_to_end(&mut bytes)
                 .map(|_| bytes)
         });
-        let deadline = Instant::now() + Duration::from_millis(1500);
+        let end = Instant::now() + deadline;
         let status = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20))
-                }
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break Err(unreadable());
+                    break None;
                 }
             }
         };
-        let bytes = reader
-            .join()
-            .map_err(|_| unreadable())?
-            .map_err(|_| unreadable())?;
-        let status = status?;
-        if !status.success() {
-            return Err(unreadable());
-        }
-        if bytes.len() as u64 > MAX_AUTH_BYTES {
-            return Err(CollectError::CredentialsMalformed {
-                detail: "Claude Keychain credential is unexpectedly large",
-            });
-        }
-        ClaudeCredentials::parse(&bytes)
+        let written = writer.is_none_or(|writer| writer.join().is_ok_and(|result| result.is_ok()));
+        let bytes = reader.join().ok()?.ok()?;
+        (status?.success() && written).then_some(bytes)
     }
 }

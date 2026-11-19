@@ -1,6 +1,6 @@
 [package]
 name = "tokenbubble-core"
-description = "Read-only subscription usage collection for TokenBubble"
+description = "Subscription usage collection for TokenBubble"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -9,7 +9,8 @@ publish.workspace = true
 base64.workspace = true
 jiff.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# preserve_order keeps Claude Code's credential keys in place when a renewed sign-in is written back.
+serde_json = { workspace = true, features = ["preserve_order"] }
 toml.workspace = true
 ureq.workspace = true
 

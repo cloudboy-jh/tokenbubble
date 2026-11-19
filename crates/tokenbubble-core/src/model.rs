@@ -26,7 +26,10 @@ impl ProviderId {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UsageSnapshot {
     pub provider: ProviderId,
+    /// When the numbers were true: the request time for live readings, the log entry time
+    /// for [`SnapshotOrigin::LocalLog`].
     pub measured_at: Timestamp,
+    pub origin: SnapshotOrigin,
     pub account: Account,
     /// Account-wide windows ordered session, weekly, other; then model-scoped windows in
     /// response order.
@@ -37,6 +40,18 @@ pub struct UsageSnapshot {
     pub spend_limit: Option<SpendLimit>,
     /// Optional response parts that were present but could not be decoded.
     pub issues: Vec<String>,
+}
+
+/// Where a snapshot's numbers came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotOrigin {
+    /// The provider's usage endpoint.
+    #[default]
+    Live,
+    /// The last limits the provider's CLI wrote to its local session log, used when the
+    /// endpoint cannot be asked.
+    LocalLog,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -96,4 +111,55 @@ pub struct SpendLimit {
     pub used: Option<f64>,
     pub remaining_percent: Option<f64>,
     pub resets_at: Option<Timestamp>,
+}
+
+/// Token use read from the provider CLI's local session logs. Independent of quota windows:
+/// providers do not publish how tokens map to limit percentages.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Activity {
+    /// Seven local calendar days ending today, oldest first; days without use are zero.
+    pub days: Vec<DayActivity>,
+    /// Totals over those seven days, largest [`TokenCounts::billable`] first.
+    pub models: Vec<NamedTokens>,
+    /// Working-directory name, same order and period as `models`.
+    pub projects: Vec<NamedTokens>,
+    /// The 60 minutes before the scan.
+    pub last_hour: TokenCounts,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DayActivity {
+    pub date: jiff::civil::Date,
+    pub tokens: TokenCounts,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct NamedTokens {
+    pub name: String,
+    pub tokens: TokenCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct TokenCounts {
+    /// Input not served from cache.
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Includes reasoning/thinking tokens.
+    pub output: u64,
+}
+
+impl TokenCounts {
+    /// Fresh input, cache writes, and output. Cache reads are excluded because they are
+    /// cheap re-reads of earlier context and would otherwise dwarf everything else.
+    pub fn billable(&self) -> u64 {
+        self.input + self.cache_write + self.output
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.input += other.input;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.output += other.output;
+    }
 }

@@ -24,12 +24,16 @@ The Mac build is ad-hoc signed, not notarized by Apple. Verify `SHA256SUMS.txt` 
 
 ## Use
 
-- Check session, weekly, and model limits with reset countdowns. **Refresh** fetches a new reading.
+- Check session, weekly, and model limits with reset countdowns, plus where each limit is heading at your current pace. **Refresh** fetches a new reading.
+- See local activity from the CLIs' own session logs: tokens today and over the last 7 days, a per-day chart, and the top models and projects.
 - **General:** choose the provider and refresh interval. Windows also supports starting at sign-in; on Mac, add the app through **System Settings → General → Login Items**.
 - **Display:** show usage or remaining quota, choose reset formatting, and toggle monetary fields.
 - **Source:** inspect the credential location, current plan, freshness, and errors.
 
-TokenBubble does not log in, renew tokens, or copy credentials from WSL. Sign in using the provider's CLI on the same computer. On Mac, Claude can read its existing Claude Code Keychain entry; TokenBubble never writes to it.
+Sign in using the provider's CLI on the same computer; TokenBubble does not copy credentials from WSL.
+
+- **Claude:** when the stored sign-in expires, TokenBubble renews it and saves it back to `.credentials.json` (or the Claude Code Keychain entry on Mac), so Claude Code keeps working. You only sign in again if you sign out or Anthropic revokes the login.
+- **Codex:** TokenBubble never changes Codex files. When the stored sign-in has expired, it shows the limits Codex last saved to its session logs; running `codex` renews the sign-in.
 
 ## Screenshots
 

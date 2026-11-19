@@ -11,11 +11,12 @@ use gpui::{
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use tokenbubble_core::model::{ProviderId, UsageSnapshot};
+use tokenbubble_core::model::{Activity, ProviderId, UsageSnapshot};
 use tokenbubble_core::providers::CollectError;
 
 use crate::presentation::{
-    BarView, Body, DisplayOptions, PanelState, PanelView, Tone, preferred_height, present,
+    ActivityView, BarView, Body, DisplayOptions, PanelState, PanelView, ShareRow, Tone,
+    preferred_height, present,
 };
 use crate::provider_icon::provider_icon;
 use crate::theme::PanelTheme;
@@ -72,6 +73,16 @@ impl UsagePanel {
     pub fn apply(&mut self, result: Result<UsageSnapshot, CollectError>, cx: &mut Context<Self>) {
         self.state.apply(result);
         self.copied = false;
+        cx.notify();
+    }
+
+    pub fn set_activity(
+        &mut self,
+        provider: ProviderId,
+        activity: Option<Activity>,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.set_activity(provider, activity);
         cx.notify();
     }
 
@@ -146,6 +157,11 @@ impl Render for UsagePanel {
             )
             .child(body(&view, &theme, self.copied, cx))
             .children((!view.money.is_empty()).then(|| money(&view, &theme)))
+            .children(
+                view.activity
+                    .as_ref()
+                    .map(|activity| activity_section(activity, &theme)),
+            )
             .child(footer(&view, &theme, cx))
     }
 }
@@ -302,6 +318,12 @@ fn quota_bar(bar: &BarView, theme: &PanelTheme) -> impl IntoElement {
                 .text_color(theme.muted)
                 .child(reset)
         }))
+        .children(bar.pace.clone().map(|(pace, tone)| {
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.tone(tone))
+                .child(pace)
+        }))
 }
 
 fn money(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
@@ -319,6 +341,117 @@ fn money(view: &PanelView, theme: &PanelTheme) -> impl IntoElement {
                 .child(div().text_color(theme.muted).child(row.label))
                 .child(row.value.clone())
         }))
+}
+
+fn activity_section(activity: &ActivityView, theme: &PanelTheme) -> impl IntoElement {
+    let busiest_height = 40.0;
+    let chart = (!activity.days.is_empty()).then(|| {
+        div()
+            .flex()
+            .gap(px(6.0))
+            .pt(px(10.0))
+            .children(activity.days.iter().map(|day| {
+                let color = if day.today { theme.accent } else { theme.muted };
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted)
+                            .child(day.value.clone()),
+                    )
+                    .child(
+                        div()
+                            .h(px(busiest_height))
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .justify_end()
+                            .rounded(px(3.0))
+                            .bg(theme.track)
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .w_full()
+                                    // A sliver keeps light days visible.
+                                    .h(px((day.fill * busiest_height).max(if day.fill > 0.0 {
+                                        2.0
+                                    } else {
+                                        0.0
+                                    })))
+                                    .bg(color),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(if day.today { theme.text } else { theme.muted })
+                            .child(day.label.clone()),
+                    )
+            }))
+    });
+    div()
+        .flex()
+        .flex_col()
+        .pt(px(12.0))
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.muted)
+                .child("Local activity · last 7 days"),
+        )
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .child(activity.summary.clone()),
+        )
+        .children(activity.note.clone().map(|note| {
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.muted)
+                .child(note)
+        }))
+        .children(chart)
+        .children(share_list("Models", &activity.models, theme))
+        .children(share_list("Projects", &activity.projects, theme))
+}
+
+fn share_list(title: &'static str, rows: &[ShareRow], theme: &PanelTheme) -> Option<gpui::Div> {
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .pt(px(10.0))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.muted)
+                    .child(title),
+            )
+            .children(rows.iter().map(|row| {
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(div().min_w_0().truncate().child(row.name.clone()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.muted)
+                            .child(row.value.clone()),
+                    )
+            })),
+    )
 }
 
 /// A small bordered text button.

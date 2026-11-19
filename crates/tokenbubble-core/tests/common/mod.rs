@@ -7,6 +7,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::Timestamp;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tokenbubble_core::secret::Secret;
 use tokenbubble_core::transport::{Request, Response, Transport, TransportError};
 
 /// Fixed clock for deterministic freshness checks: 2026-01-01T00:00:00Z.
@@ -65,28 +66,52 @@ pub struct RecordedRequest {
     pub url: String,
     pub bearer: Option<String>,
     pub headers: Vec<(String, String)>,
+    /// The exposed POST body; `None` for GET.
+    pub body: Option<String>,
 }
 
 impl RecordedRequest {
+    pub fn new(request: &Request, body: Option<&Secret>) -> Self {
+        Self {
+            url: request.url.clone(),
+            bearer: request.bearer.as_ref().map(|s| s.expose().to_owned()),
+            headers: request
+                .headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+            body: body.map(|body| body.expose().to_owned()),
+        }
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     }
+
+    pub fn json_body(&self) -> Value {
+        serde_json::from_str(self.body.as_deref().expect("not a POST")).unwrap()
+    }
 }
 
-/// Returns a canned response and records every request it receives.
+/// Returns canned responses and records every request it receives, GETs and POSTs
+/// separately. A POST without a configured response fails the test.
 pub struct MockTransport {
     response: Result<Response, TransportError>,
+    post_response: Option<Result<Response, TransportError>>,
     pub requests: Mutex<Vec<RecordedRequest>>,
+    pub posts: Mutex<Vec<RecordedRequest>>,
 }
 
 impl MockTransport {
     pub fn new(response: Result<Response, TransportError>) -> Self {
         Self {
             response,
+            post_response: None,
             requests: Mutex::new(Vec::new()),
+            posts: Mutex::new(Vec::new()),
         }
     }
 
@@ -102,22 +127,35 @@ impl MockTransport {
         }))
     }
 
+    /// Answers every POST with `response`.
+    pub fn with_post(mut self, response: Result<Response, TransportError>) -> Self {
+        self.post_response = Some(response);
+        self
+    }
+
     pub fn request_count(&self) -> usize {
         self.requests.lock().len()
+    }
+
+    pub fn post_count(&self) -> usize {
+        self.posts.lock().len()
     }
 }
 
 impl Transport for MockTransport {
     fn get(&self, request: &Request) -> Result<Response, TransportError> {
-        self.requests.lock().push(RecordedRequest {
-            url: request.url.clone(),
-            bearer: request.bearer.as_ref().map(|s| s.expose().to_owned()),
-            headers: request
-                .headers
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), v.clone()))
-                .collect(),
-        });
+        self.requests
+            .lock()
+            .push(RecordedRequest::new(request, None));
         self.response.clone()
+    }
+
+    fn post_json(&self, request: &Request, body: &Secret) -> Result<Response, TransportError> {
+        self.posts
+            .lock()
+            .push(RecordedRequest::new(request, Some(body)));
+        self.post_response
+            .clone()
+            .unwrap_or_else(|| panic!("unexpected POST to {}", request.url))
     }
 }

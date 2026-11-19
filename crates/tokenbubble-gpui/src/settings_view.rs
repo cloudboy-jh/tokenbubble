@@ -352,13 +352,15 @@ impl SettingsView {
         let (credentials, description) = match state.provider {
             ProviderId::Codex => (
                 &self.codex_credentials,
-                "Reads the sign-in Codex CLI stores on this PC. TokenBubble never signs \
-                 in, renews tokens, or changes Codex files.",
+                "Reads the sign-in Codex CLI stores on this PC. When it has expired, shows \
+                 the limits Codex last saved to its session logs. TokenBubble never changes \
+                 Codex files.",
             ),
             ProviderId::Claude => (
                 &self.claude_credentials,
-                "Reads the Claude Code sign-in stored on this PC. TokenBubble never signs \
-                 in, renews tokens, or changes Claude files. Run “claude auth login” to sign in.",
+                "Uses the Claude Code sign-in stored on this PC and renews it when it \
+                 expires, saving it back so Claude Code keeps working. Run “claude auth \
+                 login” to sign in.",
             ),
         };
         let snapshot = state.snapshot.as_ref();

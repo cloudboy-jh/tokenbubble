@@ -1,11 +1,11 @@
-//! Bounded, cookie-less, non-redirecting HTTP GET used by every collector.
+//! Bounded, cookie-less, non-redirecting HTTP used by every collector.
 
 use std::fmt;
 use std::time::Duration;
 
 use crate::secret::Secret;
 
-/// An authenticated GET request. `Debug` never shows the bearer token.
+/// An HTTP request. `Debug` never shows the bearer token.
 #[derive(Clone, Debug)]
 pub struct Request {
     pub url: String,
@@ -58,6 +58,10 @@ impl std::error::Error for TransportError {}
 
 pub trait Transport: Send + Sync {
     fn get(&self, request: &Request) -> Result<Response, TransportError>;
+
+    /// POST `body` as `application/json`. The body is a [`Secret`] because it may carry
+    /// credentials (an OAuth refresh token); it never reaches logs or errors.
+    fn post_json(&self, request: &Request, body: &Secret) -> Result<Response, TransportError>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -103,17 +107,40 @@ impl Default for HttpTransport {
 
 impl Transport for HttpTransport {
     fn get(&self, request: &Request) -> Result<Response, TransportError> {
-        let mut builder = self.agent.get(&request.url);
-        if let Some(bearer) = &request.bearer {
-            builder = builder.header("Authorization", format!("Bearer {}", bearer.expose()));
-        }
-        for (name, value) in &request.headers {
-            builder = builder.header(*name, value);
-        }
+        let result = with_headers(self.agent.get(&request.url), request).call();
+        self.finish(result)
+    }
 
-        let mut response = builder
-            .call()
-            .map_err(|error| map_error(error, self.limits))?;
+    fn post_json(&self, request: &Request, body: &Secret) -> Result<Response, TransportError> {
+        let mut builder = with_headers(self.agent.post(&request.url), request);
+        if request.header("Content-Type").is_none() {
+            builder = builder.content_type("application/json");
+        }
+        let result = builder.send(body.expose());
+        self.finish(result)
+    }
+}
+
+fn with_headers<B>(
+    mut builder: ureq::RequestBuilder<B>,
+    request: &Request,
+) -> ureq::RequestBuilder<B> {
+    if let Some(bearer) = &request.bearer {
+        builder = builder.header("Authorization", format!("Bearer {}", bearer.expose()));
+    }
+    for (name, value) in &request.headers {
+        builder = builder.header(*name, value);
+    }
+    builder
+}
+
+impl HttpTransport {
+    /// Applies the shared redirect, status, and body-size policy to any response.
+    fn finish(
+        &self,
+        result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Response, TransportError> {
+        let mut response = result.map_err(|error| map_error(error, self.limits))?;
         let status = response.status().as_u16();
         if (300..400).contains(&status) {
             return Err(TransportError::Redirect { status });

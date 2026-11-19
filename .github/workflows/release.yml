@@ -179,7 +179,7 @@ jobs:
 
           Verify your downloaded ZIP against **SHA256SUMS.txt** before opening it (`shasum -a 256 file.zip` on macOS, `Get-FileHash file.zip -Algorithm SHA256` in Windows PowerShell). Each ZIP contains **INSTALL.txt** and third-party notices.
 
-          Provider selection, usage/reset displays, background refresh, and saved settings use the existing panel. Windows users can enable **Start at sign-in** after installing the permanent copy; macOS start at sign-in is not supported. Updates are manual: quit TokenBubble, replace the installed app/executable, and reopen it. There is no app-managed login, credential refresh, installer, or automatic updater. Windows behavior is unchanged; WSL credential source selection is not included.
+          Provider selection, usage/reset displays, pace projections, local token activity from the CLIs' session logs, background refresh, and saved settings use the existing panel. When a Claude sign-in expires, TokenBubble renews it and saves it back where Claude Code keeps it (the macOS Keychain write is not yet verified on a real Mac). An expired Codex sign-in falls back to the limits Codex last logged. Windows users can enable **Start at sign-in** after installing the permanent copy; macOS start at sign-in is not supported. Updates are manual: quit TokenBubble, replace the installed app/executable, and reopen it. There is no installer or automatic updater; WSL credential source selection is not included.
           NOTES
           options=(--repo "$GH_REPO" --verify-tag --title "TokenBubble $RELEASE_TAG" --notes-file release-notes.md)
           if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease); fi

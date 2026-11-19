@@ -24,7 +24,7 @@
 
 ## Installing and releasing
 
-- Version `0.1.0-beta.2` adds macOS Apple Silicon and Intel packages alongside Windows x64. macOS requires 13 Ventura or newer.
+- Version `0.1.0-beta.3` adds Claude sign-in renewal, the Codex local-log fallback, pace projections, and local token activity. `0.1.0-beta.2` added macOS Apple Silicon and Intel packages alongside Windows x64. macOS requires 13 Ventura or newer.
 - Build Windows with `powershell -ExecutionPolicy Bypass -File tools/package-windows.ps1`; build macOS with `bash tools/package-macos.sh` on the native architecture. ZIPs and local checksums are written under `target/release-packages/`.
 - Windows ZIPs contain `tokenbubble.exe`, `INSTALL.txt`, and `THIRD_PARTY_NOTICES.md`. macOS ZIPs contain `TokenBubble.app`, installation instructions, and notices. Provider artwork and Metal shaders are embedded; the Mac bundle includes an icon and is ad-hoc signed after assembly.
 - Keep Windows outside the checkout, for example `%LOCALAPPDATA%\Programs\TokenBubble`; move the Mac app to Applications. Quit from the native icon menu before replacing the executable or app bundle, then relaunch. Updates are manual.

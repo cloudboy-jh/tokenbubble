@@ -39,6 +39,11 @@ fn total(activity: &Activity) -> TokenCounts {
     sum
 }
 
+/// A scanner that reads no Pi-format sessions, so tests never see the real home directory.
+fn scanner() -> ActivityScanner {
+    ActivityScanner::with_pi_sessions(Vec::new())
+}
+
 fn write_lines(path: &Path, lines: &[Value]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
@@ -112,7 +117,7 @@ fn claude_assistant(timestamp: &str, id: &str, request: &str, model: &str, cwd: 
 #[test]
 fn missing_log_directory_is_none() {
     let home = tempfile::tempdir().unwrap();
-    let mut scanner = ActivityScanner::new();
+    let mut scanner = scanner();
     for provider in ProviderId::ALL {
         assert_eq!(
             scanner.scan(provider, home.path(), now(), &TimeZone::UTC),
@@ -167,7 +172,7 @@ fn codex_counts_total_deltas_once_across_repeats_and_model_switches() {
     );
     fs::write(rollout.with_extension("txt"), "not a log").unwrap();
 
-    let activity = ActivityScanner::new()
+    let activity = scanner()
         .scan(ProviderId::Codex, home.path(), now(), &TimeZone::UTC)
         .unwrap();
 
@@ -243,7 +248,7 @@ fn claude_counts_each_response_once_across_chunks_and_files() {
     )
     .unwrap();
 
-    let activity = ActivityScanner::new()
+    let activity = scanner()
         .scan(ProviderId::Claude, home.path(), now(), &TimeZone::UTC)
         .unwrap();
 
@@ -282,7 +287,7 @@ fn days_follow_the_local_calendar() {
     );
     let new_york_winter = TimeZone::fixed(tz::offset(-5));
 
-    let activity = ActivityScanner::new()
+    let activity = scanner()
         .scan(ProviderId::Codex, home.path(), now(), &new_york_winter)
         .unwrap();
 
@@ -311,7 +316,7 @@ fn rescans_count_appended_lines_once() {
             ),
         ],
     );
-    let mut scanner = ActivityScanner::new();
+    let mut scanner = scanner();
     let scan = |scanner: &mut ActivityScanner| {
         scanner
             .scan(ProviderId::Codex, home.path(), now(), &TimeZone::UTC)
@@ -351,6 +356,111 @@ fn rescans_count_appended_lines_once() {
 
     fs::remove_file(&file).unwrap();
     assert_eq!(total(&scan(&mut scanner)), TokenCounts::default());
+}
+
+fn pi_reply(timestamp: &str, provider: &str, model: &str, response: &str, usage: Value) -> Value {
+    json!({
+        "type": "message",
+        "id": "a1b2c3d4",
+        "parentId": null,
+        "timestamp": timestamp,
+        "message": {
+            "role": "assistant",
+            "content": [],
+            "api": "anthropic-messages",
+            "provider": provider,
+            "model": model,
+            "responseId": response,
+            "usage": usage,
+            "timestamp": 0,
+        },
+    })
+}
+
+fn pi_usage(input: u64, cache_read: u64, cache_write: u64, output: u64) -> Value {
+    json!({
+        "input": input,
+        "output": output,
+        "cacheRead": cache_read,
+        "cacheWrite": cache_write,
+        "totalTokens": input + output + cache_read + cache_write,
+        "cost": { "total": 0.5 },
+    })
+}
+
+#[test]
+fn pi_sessions_count_toward_the_provider_whose_sign_in_they_used() {
+    let home = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let header = json!({ "type": "session", "version": 3, "id": "s", "timestamp": "2026-01-10T14:00:00Z", "cwd": "/work/app" });
+    let opus = pi_reply(
+        "2026-01-10T14:30:00Z",
+        "anthropic",
+        "claude-opus-5-5",
+        "msg_1",
+        pi_usage(2, 4000, 300, 50),
+    );
+    write_lines(
+        &sessions.path().join("-work-app").join("one.jsonl"),
+        &[
+            header.clone(),
+            json!({ "type": "message", "timestamp": "2026-01-10T14:29:00Z", "message": { "role": "user", "content": "\"usage\": 9" } }),
+            opus.clone(),
+            json!({
+                "type": "model_usage",
+                "timestamp": "2026-01-10T14:31:00Z",
+                "purpose": "title",
+                "role": "smol",
+                "provider": "anthropic",
+                "model": "claude-opus-5-5",
+                "usage": pi_usage(500, 0, 0, 30),
+                "message": null,
+            }),
+            pi_reply(
+                "2026-01-10T14:32:00Z",
+                "anthropic",
+                "claude-opus-5-5",
+                "msg_failed",
+                pi_usage(0, 0, 0, 0),
+            ),
+            pi_reply(
+                "2026-01-10T14:33:00Z",
+                "openai-codex",
+                "gpt-6.1-sol",
+                "resp_1",
+                pi_usage(100, 900, 0, 20),
+            ),
+            pi_reply(
+                "2026-01-10T14:34:00Z",
+                "openrouter",
+                "claude-opus-5-5",
+                "or_1",
+                pi_usage(7, 0, 0, 7),
+            ),
+        ],
+    );
+    // A fork copies its parent's replies.
+    write_lines(
+        &sessions.path().join("-work-app").join("fork.jsonl"),
+        &[header, opus],
+    );
+
+    let mut scanner = ActivityScanner::with_pi_sessions(vec![sessions.path().to_owned()]);
+    let claude = scanner
+        .scan(ProviderId::Claude, home.path(), now(), &TimeZone::UTC)
+        .unwrap();
+    let expected = tokens(502, 4000, 300, 80);
+    assert_eq!(names(&claude.models), [("claude-opus-5-5", expected)]);
+    assert_eq!(names(&claude.projects), [("app", expected)]);
+    assert_eq!(claude.last_hour, expected);
+
+    let codex = scanner
+        .scan(ProviderId::Codex, home.path(), now(), &TimeZone::UTC)
+        .unwrap();
+    assert_eq!(
+        names(&codex.models),
+        [("gpt-6.1-sol", tokens(100, 900, 0, 20))]
+    );
 }
 
 #[test]

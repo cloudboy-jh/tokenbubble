@@ -1,7 +1,8 @@
-//! Token use read from the provider CLIs' local session logs.
+//! Token use read from local session logs: the provider CLIs' own, plus those of Oh My Pi
+//! and Pi, agents that call Claude and Codex with the same sign-ins.
 //!
-//! Logs are append-only JSONL files the CLIs write while they run. A scan walks the provider's
-//! log directory, re-reads only files whose length or modification time changed since the
+//! Logs are append-only JSONL files written while a session runs. A scan walks the log
+//! directories, re-reads only files whose length or modification time changed since the
 //! previous scan (resuming after the last complete line when a file only grew), and aggregates
 //! the cached entries. Unreadable files and malformed lines are skipped.
 
@@ -36,20 +37,43 @@ const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// Incremental scanner over one or more providers' session logs. Keep one instance alive and
 /// call [`scan`](Self::scan) periodically; unchanged files are never re-read.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ActivityScanner {
     /// Per provider, every recent log file seen by the last scan, in path order.
     files: HashMap<ProviderId, BTreeMap<PathBuf, CachedFile>>,
+    /// Session directories of Pi-format agents, read for every provider.
+    pi_roots: Vec<PathBuf>,
+}
+
+impl Default for ActivityScanner {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ActivityScanner {
+    /// Also reads Oh My Pi (`~/.omp/agent/sessions`) and Pi (`~/.pi/agent/sessions`) sessions.
     pub fn new() -> Self {
-        Self::default()
+        let pi_roots = std::env::home_dir().map_or_else(Vec::new, |home| {
+            vec![
+                home.join(".omp").join("agent").join("sessions"),
+                home.join(".pi").join("agent").join("sessions"),
+            ]
+        });
+        Self::with_pi_sessions(pi_roots)
+    }
+
+    /// Reads Pi-format agent sessions from `roots` instead of the default locations.
+    pub fn with_pi_sessions(roots: Vec<PathBuf>) -> Self {
+        Self {
+            files: HashMap::new(),
+            pi_roots: roots,
+        }
     }
 
     /// Token activity for the seven local days ending today in `tz`. `home` is the provider's
-    /// CLI home (`CODEX_HOME` or Claude's config directory). `None` when the provider's log
-    /// directory does not exist.
+    /// CLI home (`CODEX_HOME` or Claude's config directory). `None` when neither the CLI's
+    /// log directory nor any Pi-format session directory exists.
     pub fn scan(
         &mut self,
         provider: ProviderId,
@@ -58,7 +82,7 @@ impl ActivityScanner {
         tz: &TimeZone,
     ) -> Option<Activity> {
         let roots = log_roots(provider, home);
-        if !roots.iter().any(|root| root.is_dir()) {
+        if !roots.iter().chain(&self.pi_roots).any(|root| root.is_dir()) {
             self.files.remove(&provider);
             return None;
         }
@@ -69,17 +93,42 @@ impl ActivityScanner {
         for root in &roots {
             collect_jsonl(root, &mut found);
         }
+        let native = found.len();
+        for root in &self.pi_roots {
+            collect_jsonl(root, &mut found);
+        }
+        let native_format = match provider {
+            ProviderId::Codex => LogFormat::Codex,
+            ProviderId::Claude => LogFormat::Claude,
+        };
 
         let cache = self.files.entry(provider).or_default();
         let mut previous = std::mem::take(cache);
-        for file in found.into_iter().filter(|file| file.modified >= oldest) {
+        for (index, file) in found.into_iter().enumerate() {
+            if file.modified < oldest {
+                continue;
+            }
+            let format = if index < native {
+                native_format
+            } else {
+                LogFormat::Pi(provider)
+            };
             let cached = previous.remove(&file.path);
-            if let Some(cached) = refresh(provider, &file, cached, now) {
+            if let Some(cached) = refresh(format, &file, cached, now) {
                 cache.insert(file.path, cached);
             }
         }
         Some(aggregate(cache.values(), now, tz))
     }
+}
+
+/// How a log file's lines are parsed.
+#[derive(Clone, Copy, Debug)]
+enum LogFormat {
+    Codex,
+    Claude,
+    /// Oh My Pi or Pi; only calls made with this provider's sign-in count.
+    Pi(ProviderId),
 }
 
 /// A log file found on disk, with the metadata that decides whether it must be re-read.
@@ -212,9 +261,11 @@ struct CachedFile {
 /// Context carried between lines of one file.
 #[derive(Debug, Default)]
 struct ParseState {
-    /// Codex: model of the current turn. Claude: last model seen, reused to share the string.
+    /// Codex: model of the current turn. Claude and Pi: last model seen, reused to share the
+    /// string.
     model: Option<Arc<str>>,
     /// Codex: project of the current turn. Claude: last project seen, reused likewise.
+    /// Pi: the session's working directory.
     project: Option<Arc<str>>,
     /// Codex: the session's cumulative usage at the previous `token_count` event.
     total: Option<RawCodexUsage>,
@@ -232,7 +283,7 @@ struct Entry {
 
 /// Brings a file's cache up to date, or `None` when the file cannot be read.
 fn refresh(
-    provider: ProviderId,
+    format: LogFormat,
     file: &LogFile,
     cached: Option<CachedFile>,
     now: Timestamp,
@@ -258,10 +309,13 @@ fn refresh(
         MAX_LINE_BYTES,
     );
     while let Some(line) = lines.next_line() {
-        match provider {
-            ProviderId::Codex => parse_codex_line(line, &mut cached.state, &mut cached.entries),
-            ProviderId::Claude => {
+        match format {
+            LogFormat::Codex => parse_codex_line(line, &mut cached.state, &mut cached.entries),
+            LogFormat::Claude => {
                 parse_claude_line(line, &mut cached.state, &mut cached.entries);
+            }
+            LogFormat::Pi(provider) => {
+                parse_pi_line(line, provider, &mut cached.state, &mut cached.entries);
             }
         }
     }
@@ -502,6 +556,132 @@ fn parse_claude_line(line: &str, state: &mut ParseState, entries: &mut Vec<Entry
         at,
         model: intern(&mut state.model, model),
         project: intern(&mut state.project, project),
+        tokens,
+        key,
+    });
+}
+
+/// An Oh My Pi or Pi session line. A `session` header names the working directory;
+/// assistant replies are `message` lines; calls the agent makes on its own (titles,
+/// captions) are `model_usage` lines carrying the call's fields at the top level.
+#[derive(Deserialize)]
+struct PiLine<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Cow<'a, str>,
+    #[serde(default, borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    message: Option<PiCall<'a>>,
+    #[serde(default, borrow)]
+    provider: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    model: Option<Cow<'a, str>>,
+    #[serde(default)]
+    usage: Option<PiUsage>,
+}
+
+#[derive(Deserialize)]
+struct PiCall<'a> {
+    #[serde(default, borrow)]
+    role: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    provider: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    model: Option<Cow<'a, str>>,
+    #[serde(rename = "responseId", default, borrow)]
+    response_id: Option<Cow<'a, str>>,
+    #[serde(default)]
+    usage: Option<PiUsage>,
+}
+
+/// Pi usage. `input` excludes cache reads; `output` includes reasoning.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiUsage {
+    #[serde(default)]
+    input: Option<u64>,
+    #[serde(default)]
+    cache_read: Option<u64>,
+    #[serde(default)]
+    cache_write: Option<u64>,
+    #[serde(default)]
+    output: Option<u64>,
+}
+
+/// Pi's name for the API that bills `provider`'s subscription.
+fn pi_provider(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Codex => "openai-codex",
+        ProviderId::Claude => "anthropic",
+    }
+}
+
+fn parse_pi_line(
+    line: &str,
+    provider: ProviderId,
+    state: &mut ParseState,
+    entries: &mut Vec<Entry>,
+) {
+    if !line.contains(r#""usage":"#) && !line.contains(r#""type":"session""#) {
+        return;
+    }
+    let Ok(parsed) = serde_json::from_str::<PiLine>(line) else {
+        return;
+    };
+    let (call_provider, model, usage, response_id) = match parsed.kind.as_ref() {
+        "session" => {
+            if let Some(cwd) = parsed.cwd {
+                intern(&mut state.project, project_name(&cwd));
+            }
+            return;
+        }
+        "message" => match parsed.message {
+            Some(call) if call.role.as_deref() == Some("assistant") => {
+                (call.provider, call.model, call.usage, call.response_id)
+            }
+            _ => return,
+        },
+        "model_usage" => (parsed.provider, parsed.model, parsed.usage, None),
+        _ => return,
+    };
+    if call_provider.as_deref() != Some(pi_provider(provider)) {
+        return;
+    }
+    let (Some(usage), Some(at)) = (
+        usage,
+        parsed
+            .timestamp
+            .and_then(|timestamp| timestamp.parse::<Timestamp>().ok()),
+    ) else {
+        return;
+    };
+    let tokens = TokenCounts {
+        input: usage.input.unwrap_or(0),
+        cache_read: usage.cache_read.unwrap_or(0),
+        cache_write: usage.cache_write.unwrap_or(0),
+        output: usage.output.unwrap_or(0),
+    };
+    // Failed calls are logged with empty usage.
+    if tokens == TokenCounts::default() {
+        return;
+    }
+    let model = model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(UNKNOWN);
+    // Forked sessions copy their parent's replies, response ids included.
+    let key = response_id.map(|id| {
+        let mut hasher = DefaultHasher::new();
+        ("pi", id.as_ref()).hash(&mut hasher);
+        hasher.finish()
+    });
+    entries.push(Entry {
+        at,
+        model: intern(&mut state.model, model),
+        project: state.project.clone().unwrap_or_else(|| UNKNOWN.into()),
         tokens,
         key,
     });

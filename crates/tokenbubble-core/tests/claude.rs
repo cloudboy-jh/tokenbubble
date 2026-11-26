@@ -155,11 +155,11 @@ fn missing_or_blank_tokens_and_malformed_credentials_are_rejected() {
 fn credential_reads_are_bounded_and_do_not_modify_the_file() {
     let (_directory, source) = source_with(&auth());
     let before = std::fs::read(source.credential_path()).unwrap();
-    claude::load_credentials(&source.claude_home).unwrap();
+    claude::load_credentials(&source.claude_home, now()).unwrap();
     assert_eq!(std::fs::read(source.credential_path()).unwrap(), before);
     std::fs::write(source.credential_path(), vec![b' '; 1024 * 1024 + 1]).unwrap();
     assert!(matches!(
-        claude::load_credentials(&source.claude_home),
+        claude::load_credentials(&source.claude_home, now()),
         Err(CollectError::CredentialsMalformed { .. })
     ));
 }
@@ -472,7 +472,7 @@ fn snapshots_and_debug_never_serialize_credential_material() {
     let transport =
         MockTransport::ok(fixture("claude/usage_full.json")).with_post(token_response(renewal()));
     let snapshot = claude::collect(&source, &transport, now()).unwrap();
-    let renewed = claude::load_credentials(&source.claude_home).unwrap();
+    let renewed = claude::load_credentials(&source.claude_home, now()).unwrap();
     let visible = format!(
         "{credentials:?} {renewed:?} {request:?} {snapshot:?} {}",
         serde_json::to_string(&snapshot).unwrap()

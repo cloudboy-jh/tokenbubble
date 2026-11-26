@@ -75,7 +75,7 @@ pub fn collect(
     now: Timestamp,
 ) -> Result<UsageSnapshot, CollectError> {
     let home = &source.claude_home;
-    let mut credentials = credentials::load(home)?;
+    let mut credentials = credentials::load(home, now)?;
     let mut renewed = false;
     match credentials.ensure_usable(now) {
         Ok(()) => {}

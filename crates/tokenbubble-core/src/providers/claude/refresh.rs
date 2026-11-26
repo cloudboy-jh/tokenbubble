@@ -38,7 +38,7 @@ pub(super) fn renew(
     now: Timestamp,
     unrenewable: CollectError,
 ) -> Result<ClaudeCredentials, CollectError> {
-    let current = Document::read(claude_home)?.credentials()?;
+    let current = Document::read(claude_home, now)?.credentials()?;
     match current.ensure_usable(now) {
         Ok(()) if current.access_token != stale.access_token => return Ok(current),
         Ok(()) | Err(CollectError::AuthRequired { .. }) => {}
@@ -48,7 +48,7 @@ pub(super) fn renew(
         return Err(unrenewable);
     };
     let redeemed = redeem(transport, &refresh_token);
-    let latest = Document::read(claude_home)?;
+    let latest = Document::read(claude_home, now)?;
     let stored = latest.credentials()?;
     if stored.refresh_token.as_ref() != Some(&refresh_token) {
         // Claude Code (or another reading) saved its own renewal meanwhile; that store is

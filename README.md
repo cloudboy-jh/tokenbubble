@@ -32,7 +32,7 @@ The Mac build is ad-hoc signed, not notarized by Apple. Verify `SHA256SUMS.txt` 
 
 Sign in using the provider's CLI on the same computer; TokenBubble does not copy credentials from WSL.
 
-- **Claude:** when the stored sign-in expires, TokenBubble renews it and saves it back to `.credentials.json` (or the Claude Code Keychain entry on Mac), so Claude Code keeps working. You only sign in again if you sign out or Anthropic revokes the login.
+- **Claude:** when the stored sign-in expires, TokenBubble renews it and saves it back to `.credentials.json` (or the Claude Code Keychain entry on Mac), so Claude Code keeps working. You only sign in again if you sign out or Anthropic revokes the login. On Mac, a leftover `~/.claude/.credentials.json` that can't report usage is skipped in favor of the Keychain entry.
 - **Codex:** TokenBubble never changes Codex files. When the stored sign-in has expired, it shows the limits Codex last saved to its session logs; running `codex` renews the sign-in.
 
 ## Screenshots

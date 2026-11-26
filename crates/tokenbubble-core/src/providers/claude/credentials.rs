@@ -127,8 +127,9 @@ fn nonempty(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub fn load(claude_home: &Path) -> Result<ClaudeCredentials, CollectError> {
-    Document::read(claude_home)?.credentials()
+/// Loads the stored credentials; see [`Document::read`] for which store is chosen at `now`.
+pub fn load(claude_home: &Path, now: Timestamp) -> Result<ClaudeCredentials, CollectError> {
+    Document::read(claude_home, now)?.credentials()
 }
 
 /// Where Claude Code keeps the credentials TokenBubble read.
@@ -146,24 +147,55 @@ pub(super) struct Document {
 }
 
 impl Document {
-    pub(super) fn read(claude_home: &Path) -> Result<Self, CollectError> {
+    /// Reads `.credentials.json`. On macOS, Claude Code keeps the default profile's sign-in
+    /// in the Keychain, and a file beside it may be a missing, scope-less, or stale leftover:
+    /// unless the file is usable at `now`, a Keychain sign-in that can report usage (now or
+    /// after renewal) is read instead.
+    pub(super) fn read(
+        claude_home: &Path,
+        // Only macOS chooses between stores.
+        #[cfg_attr(not(target_os = "macos"), expect(unused_variables))] now: Timestamp,
+    ) -> Result<Self, CollectError> {
         let path = claude_home.join(AUTH_FILE);
-        let result = read_bounded(&path);
+        let file = read_bounded(&path).map(|bytes| Self {
+            store: Store::File(path),
+            bytes,
+        });
         #[cfg(target_os = "macos")]
-        if matches!(result, Err(CollectError::CredentialsMissing { .. }))
+        if !file
+            .as_ref()
+            .is_ok_and(|document| document.check(now).is_ok())
             && std::env::home_dir().is_some_and(|home| claude_home == home.join(".claude"))
         {
             // The shared Keychain item belongs only to the default CLI profile.
             // An explicitly selected directory must never fall back to another account.
-            return Ok(Self {
-                bytes: keychain::load(&path)?,
+            let path = claude_home.join(AUTH_FILE);
+            let keychain = keychain::load(&path).map(|bytes| Self {
                 store: Store::Keychain(path),
+                bytes,
             });
+            return match (file, keychain) {
+                (_, Ok(keychain)) if keychain.renewable(now) => Ok(keychain),
+                (Err(CollectError::CredentialsMissing { .. }), keychain) => keychain,
+                (file, _) => file,
+            };
         }
-        Ok(Self {
-            bytes: result?,
-            store: Store::File(path),
-        })
+        file
+    }
+
+    /// Fails unless these credentials can report usage at `now`.
+    #[cfg(target_os = "macos")]
+    fn check(&self, now: Timestamp) -> Result<(), CollectError> {
+        self.credentials()?.ensure_usable(now)
+    }
+
+    /// Whether these credentials can report usage at `now`, possibly after a renewal.
+    #[cfg(target_os = "macos")]
+    fn renewable(&self, now: Timestamp) -> bool {
+        matches!(
+            self.check(now),
+            Ok(()) | Err(CollectError::AuthRequired { .. })
+        )
     }
 
     pub(super) fn credentials(&self) -> Result<ClaudeCredentials, CollectError> {
